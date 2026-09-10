@@ -104,6 +104,18 @@ CONFIG: dict[str, Any] = {
     "REPORT_TITLE": "BİRLEŞTİRİLMİŞ EXCEL RAPORU",
     "SUMMARY_SHEET": "Özet & Dashboard",
     "DASHBOARD_TOP_N": 10,
+    # Açık/kapalı ve iş sırası özeti; yalnızca rapora alınan kayıtlar sayılır.
+    "WORKFLOW_SUMMARY": {
+        "ENABLED": True,               # False: bu özet bölümünü gösterme.
+        # COLUMN_SCHEMA'daki standart adlar; kaynak alternatifleri aliases ile tanımlanır.
+        "STATUS_COLUMN": "Open / Closed",
+        "COMPANY_COLUMN": "My Company",
+        # Baş/son boşluk ve harf büyüklüğü yok sayılır; devamındaki metin serbesttir.
+        "OPEN_PREFIX": "open",
+        "CLOSED_PREFIX": "closed",
+        # Yalnızca açık kayıtta: My Company boşsa bizde, doluysa diğer şirkette.
+        # Eksik sütun/okunamayan formül ile bilinmeyen durum ayrı sayılır.
+    },
     # Başlık adı COLUMN_SCHEMA'daki standart ad olmalıdır. Klasör özel boyuttur.
     "CHARTS": (("Klasör", "bar"), ("ATA", "column"),
                ("Panel", "doughnut"), ("Reviewer Name", "bar")),
@@ -137,6 +149,8 @@ COLUMN_SCHEMA = [
     ColumnSpec("Reviewer Name", ("Reviever Name", "Rewiever Name", "Reviwer Name",
                                 "Name of Reviewer", "Reviewer", "İnceleyen",
                                 "İnceleyen Adı", "Değerlendiren"), width=28),
+    ColumnSpec("Open / Closed", ("Open Closed", "Open/Closed"), width=30),
+    ColumnSpec("My Company", width=30),
     # ColumnSpec("Comment", ("Comments", "Review Comment", "Açıklama", "Yorum"), width=55),
     # ColumnSpec("Status", ("Staus", "Review Status", "Durum"), width=20),
     # ColumnSpec("Due Date", ("Deadline", "Target Date", "Termin", "Bitiş Tarihi"), width=19),
@@ -476,6 +490,29 @@ def validate(cfg: dict[str, Any], schema: Sequence[ColumnSpec]) -> None:
         re.compile(cfg["ROW_ID_REGEX"])
     if cfg["ROW_ID_COLUMN"] not in names:
         raise ValueError("ROW_ID_COLUMN tanımlı bir standart sütun olmalı.")
+    validate_workflow_config(cfg, names)
+
+
+def validate_workflow_config(cfg: dict[str, Any], names: Sequence[str]) -> None:
+    """Etkin iş sırası özetinde hatalı sütun ve çakışan önekleri reddeder."""
+    settings = cfg.get("WORKFLOW_SUMMARY", {"ENABLED": False})
+    if not isinstance(settings, dict) or not isinstance(settings.get("ENABLED"), bool):
+        raise ValueError("WORKFLOW_SUMMARY.ENABLED True veya False olmalı.")
+    if not settings["ENABLED"]:
+        return
+    for key in ("STATUS_COLUMN", "COMPANY_COLUMN"):
+        if settings.get(key) not in names:
+            raise ValueError(f"WORKFLOW_SUMMARY.{key} tanımlı bir standart sütun olmalı.")
+    if settings["STATUS_COLUMN"] == settings["COMPANY_COLUMN"]:
+        raise ValueError("Durum ve şirket sütunları farklı olmalı.")
+    prefixes = []
+    for key in ("OPEN_PREFIX", "CLOSED_PREFIX"):
+        value = settings.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"WORKFLOW_SUMMARY.{key} boş olmayan bir metin olmalı.")
+        prefixes.append(value.strip().casefold())
+    if prefixes[0].startswith(prefixes[1]) or prefixes[1].startswith(prefixes[0]):
+        raise ValueError("Açık ve kapalı önekleri birbiriyle çakışmamalı.")
 
 
 def excel_col(index: int) -> str:
@@ -873,6 +910,34 @@ def group_stats(report: Report, schema: Sequence[ColumnSpec]) -> list[dict[str, 
     return output
 
 
+def workflow_counts(records: Iterable[Record], settings: dict[str, Any]) -> Counter[str]:
+    """Durum önekini sayar; yalnızca açık kayıtlarda şirket hücresini inceler.
+
+    Eksik şirket sütunu boş hücre sayılmaz. Formül sonucu okunamadığında da
+    sıra tahmin edilmez. Sıfır ve False dolu hücredir; boşluk metni boş hücredir.
+    """
+    counts: Counter[str] = Counter()
+    open_prefix = settings["OPEN_PREFIX"].strip().casefold()
+    closed_prefix = settings["CLOSED_PREFIX"].strip().casefold()
+    company_column = settings["COMPANY_COLUMN"]
+    for record in records:
+        status = record.values.get(settings["STATUS_COLUMN"])
+        status = status.strip().casefold() if isinstance(status, str) and usable_value(status) else ""
+        if status.startswith(closed_prefix):
+            counts["closed"] += 1
+            continue
+        if not status.startswith(open_prefix):
+            counts["unknown_status"] += 1
+            continue
+        counts["open"] += 1
+        company = record.values.get(company_column)
+        if company_column not in record.values or (nonempty(company) and not usable_value(company)):
+            counts["unknown_turn"] += 1
+        else:
+            counts["other_company" if nonempty(company) else "our_company"] += 1
+    return counts
+
+
 def build_formats(workbook: Any, cfg: dict[str, Any]) -> dict[str, Any]:
     base = {"font_name": "Calibri", "font_size": 11, "font_color": PALETTE["ink"], "valign": "vcenter"}
     definitions = {
@@ -1074,6 +1139,35 @@ def make_chart(workbook: Any, helper: Any, start_row: int, dimension: str, kind:
     return chart
 
 
+def write_workflow_summary(ws: Any, report: Report, settings: dict[str, Any],
+                           formats: dict[str, Any]) -> None:
+    """Genel ve klasör bazındaki durum/sıra sayılarını dashboard'a yazar."""
+    per_group = [(group.name, workflow_counts(group.records, settings)) for group in report.groups]
+    totals: Counter[str] = Counter()
+    for _, counts in per_group:
+        totals.update(counts)
+    ws.merge_range(11, 0, 11, 19, "AÇIK / KAPALI VE İŞ SIRASI", formats["section"])
+    spans = [(0, 4), (5, 6), (7, 8), (9, 11), (12, 14), (15, 17), (18, 19)]
+    labels = ["Klasör", "Açık", "Kapalı", "Sıra bizde", "Sıra diğer şirkette",
+              "Durum belirsiz", "Sıra belirsiz (açık)"]
+    keys = ("open", "closed", "our_company", "other_company", "unknown_status", "unknown_turn")
+    for (first, last), label in zip(spans, labels):
+        ws.merge_range(12, first, 12, last, label, formats["header"])
+    ws.set_row(12, 48)
+    for row, (label, counts) in enumerate([("GENEL TOPLAM", totals), *per_group], 13):
+        values = [label, *(counts[key] for key in keys)]
+        for (first, last), value in zip(spans, values):
+            style = "body" if first == 0 else "integer"
+            ws.merge_range(row, first, row, last, "", formats[style])
+            write_value(ws, row, first, value, formats, style)
+        ws.set_row(row, 28)
+    note_row = 15 + len(per_group)
+    ws.merge_range(note_row, 0, note_row + 1, 19,
+                   f"Yalnızca açık kayıtlarda: {settings['COMPANY_COLUMN']} boşsa sıra bizde, doluysa diğer şirkette. "
+                   "Kapalı kayıtlar sıra hesabına dahil değildir. Tanınmayan/eksik durumlar ve açık kayıtlardaki "
+                   "eksik şirket sütunu veya okunamayan formül sonucu belirsiz olarak gösterilir.", formats["subtitle"])
+
+
 def write_dashboard(workbook: Any, ws: Any, helper: Any, report: Report,
                     cfg: dict[str, Any], schema: Sequence[ColumnSpec], formats: dict[str, Any]) -> None:
     stats = group_stats(report, schema)
@@ -1081,12 +1175,14 @@ def write_dashboard(workbook: Any, ws: Any, helper: Any, report: Report,
     errors = sum(e["Seviye"] == "ERROR" for e in report.events)
     warnings = sum(e["Seviye"] == "WARNING" for e in report.events)
     filled, possible = sum(s["filled"] for s in stats), sum(s["possible"] for s in stats)
+    workflow = cfg.get("WORKFLOW_SUMMARY", {"ENABLED": False})
+    workflow_offset = len(stats) + 6 if workflow["ENABLED"] else 0
     ws.hide_gridlines(2)
     ws.set_tab_color(PALETTE["navy"])
     ws.set_zoom(85)
     ws.set_column(0, 19, 7.8)
     ws.set_default_row(20)
-    for r in range(0, 58 + len(stats)):
+    for r in range(0, 58 + len(stats) + workflow_offset):
         ws.set_row(r, 20, formats["pale"])
     ws.set_row(0, 29)
     ws.set_row(1, 29)
@@ -1121,23 +1217,27 @@ def write_dashboard(workbook: Any, ws: Any, helper: Any, report: Report,
         message, style = "Aktarım tamamlandı. Eşleştirme kararları ve kaynak konumları denetim sayfalarında kayıtlıdır.", "ok"
     ws.merge_range("A10:T10", message, formats[style])
     ws.set_row(9, 29)
+    if workflow["ENABLED"]:
+        write_workflow_summary(ws, report, workflow, formats)
     positions = [(12, 0), (12, 10), (26, 0), (26, 10)]
     for i, (dimension, kind) in enumerate(cfg["CHARTS"]):
         categories = top_categories(category_counts(report, dimension), cfg["DASHBOARD_TOP_N"])
         r, c = positions[i]
+        r += workflow_offset
         if categories:
             chart = make_chart(workbook, helper, 12 + i * (cfg["DASHBOARD_TOP_N"] + 5),
                                dimension, kind, categories, i, formats)
             ws.insert_chart(r, c, chart, {"x_offset": 3, "y_offset": 3})
         else:
             ws.merge_range(r, c, r + 11, c + 8, f"{dimension}\nGrafik için veri bulunamadı.", formats["subtitle"])
-    ws.merge_range("A41:T41", "KLASÖR BAZINDA ÖZET", formats["section"])
+    ws.merge_range(40 + workflow_offset, 0, 40 + workflow_offset, 19,
+                   "KLASÖR BAZINDA ÖZET", formats["section"])
     spans = [(0, 4), (5, 6), (7, 8), (9, 10), (11, 13), (14, 16), (17, 19)]
     labels = ["Klasör / Sayfa", "Dosya", "Sayfa", "Kayıt", "Alan doluluğu", "Uyarı + hata", "Karantina"]
     for (c1, c2), label in zip(spans, labels):
-        ws.merge_range(42, c1, 42, c2, label, formats["header"])
-    ws.set_row(42, 32)
-    for r, item in enumerate(stats, 43):
+        ws.merge_range(42 + workflow_offset, c1, 42 + workflow_offset, c2, label, formats["header"])
+    ws.set_row(42 + workflow_offset, 32)
+    for r, item in enumerate(stats, 43 + workflow_offset):
         g = item["group"]
         values = [g.name, item["files"], item["sheets"], item["records"], item["completeness"],
                   item["warnings"], item["quarantine"]]
@@ -1148,7 +1248,7 @@ def write_dashboard(workbook: Any, ws: Any, helper: Any, report: Report,
         ws.set_row(r, 28)
         if g.sheet_names:
             ws.write_url(r, 0, internal_link(g.sheet_names[0]), formats["link"], g.name)
-    end = 44 + len(stats)
+    end = 44 + len(stats) + workflow_offset
     completeness = filled / possible if possible else 0
     ws.merge_range(end, 0, end, 19,
                    f"Genel alan doluluğu: {completeness:.1%}  |  Taranan dosya: {sum(s['found'] for s in stats)}  |  "
