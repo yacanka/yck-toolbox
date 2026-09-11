@@ -66,6 +66,16 @@ class WorkflowTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     fusion.validate(cfg, fusion.COLUMN_SCHEMA)
 
+    def test_invalid_report_group_mode(self):
+        self.cfg["REPORT_GROUP_MODE"] = "folder_name"
+        with self.assertRaisesRegex(ValueError, "REPORT_GROUP_MODE"):
+            fusion.validate(self.cfg, fusion.COLUMN_SCHEMA)
+
+    def test_missing_report_group_mode_keeps_legacy_default(self):
+        del self.cfg["REPORT_GROUP_MODE"]
+        fusion.validate(self.cfg, fusion.COLUMN_SCHEMA)
+        self.assertEqual(fusion.report_group_mode(self.cfg), "subfolder")
+
     def test_disabled_and_legacy_config(self):
         self.cfg["WORKFLOW_SUMMARY"] = {"ENABLED": False}
         fusion.validate(self.cfg, fusion.COLUMN_SCHEMA)
@@ -77,8 +87,99 @@ class WorkflowTests(unittest.TestCase):
         matches = matcher.match(["Open/Closed\nAçıklama", "My Company\nYanıtınızı yazın"])
         self.assertEqual([match.target for match in matches], ["Open / Closed", "My Company"])
 
+    def test_none_row_id_column_uses_source_row_number_for_regex(self):
+        self.cfg["ROW_ID_COLUMN"] = None
+        self.cfg["ROW_ID_REGEX"] = r"^12$"
+
+        fusion.validate(self.cfg, fusion.COLUMN_SCHEMA)
+
+        data = {"No.": "sütundaki-değer", "Entity": "E"}
+        self.assertIsNone(fusion.rejection_reason(data, self.cfg, 12))
+        self.assertEqual(fusion.rejection_reason(data, self.cfg, 13), "KAYIT_NO_BİÇİMİ")
+
+    def test_none_row_id_column_keeps_footer_detection(self):
+        self.cfg["ROW_ID_COLUMN"] = None
+        data = {"No.": "total", "Entity": None}
+
+        self.assertEqual(fusion.rejection_reason(data, self.cfg, 12), "ALT_BİLGİ/TOPLAM")
+
+    def test_none_row_id_column_keeps_repeated_header_detection(self):
+        self.cfg["ROW_ID_COLUMN"] = None
+        self.cfg["EXPECTED_HEADER_ROW"] = 1
+        rows = [
+            fusion.SourceRow(1, ["No.", "Entity", "Panel"]),
+            fusion.SourceRow(2, ["A", "Entity A", "Panel A"]),
+            fusion.SourceRow(3, ["No.", "Entity", "Panel"]),
+            fusion.SourceRow(4, ["B", "Entity B", "Panel B"]),
+        ]
+        group = fusion.Group("Test")
+        report = fusion.Report(Path("."), Path("report.xlsx"))
+        matcher = fusion.HeaderMatcher(fusion.COLUMN_SCHEMA, self.cfg)
+
+        self.assertTrue(fusion.extract_sheet(rows, group, report, "source.xlsx", "Data",
+                                             matcher, self.cfg))
+        self.assertEqual([record.values["No."] for record in group.records], ["A", "B"])
+        self.assertTrue(any(event["Kod"] == "REPEATED_HEADER" for event in report.events))
+
 
 class WorkbookTests(unittest.TestCase):
+    @staticmethod
+    def create_source(path, sheets):
+        import openpyxl
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        workbook = openpyxl.Workbook()
+        workbook.remove(workbook.active)
+        for title, number in sheets:
+            sheet = workbook.create_sheet(title)
+            sheet.append(["No.", "Entity", "Panel"])
+            sheet.append([number, f"Entity {number}", f"Panel {number}"])
+        workbook.save(path)
+        workbook.close()
+
+    def test_sheet_name_mode_groups_same_sheets_across_all_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "kaynaklar"
+            self.create_source(root / "Kök.xlsx", [("Data", 1)])
+            self.create_source(root / "Grup A" / "a.xlsx", [("Data", 2), ("Diğer", 20)])
+            self.create_source(root / "Grup B" / "b.xlsx", [("data", 3)])
+
+            cfg = copy.deepcopy(fusion.CONFIG)
+            cfg["REPORT_GROUP_MODE"] = "sheet_name"
+            cfg["INCLUDE_ROOT_FILES"] = False
+            fusion.validate(cfg, fusion.COLUMN_SCHEMA)
+            report = fusion.Report(root, root / "report.xlsx")
+
+            fusion.discover(report, cfg)
+            self.assertEqual(len(report.source_files), 3)
+            self.assertEqual(report.groups, [])
+
+            fusion.collect(report, cfg, fusion.COLUMN_SCHEMA)
+            self.assertEqual([group.name for group in report.groups], ["Data", "Diğer"])
+            data_group, other_group = report.groups
+            self.assertEqual([record.values["No."] for record in data_group.records], [2, 3, 1])
+            self.assertEqual({record.sheet for record in data_group.records}, {"Data", "data"})
+            self.assertEqual(len(data_group.files), 3)
+            self.assertEqual(len(data_group.read_files), 3)
+            self.assertEqual(data_group.table_count, 3)
+            self.assertEqual([record.values["No."] for record in other_group.records], [20])
+            self.assertFalse(any(event["Seviye"] == "ERROR" for event in report.events))
+
+            cfg["WORKFLOW_SUMMARY"]["ENABLED"] = False
+            fusion.save_report(report, cfg, fusion.COLUMN_SCHEMA)
+            import openpyxl
+            result = openpyxl.load_workbook(report.output, data_only=True)
+            try:
+                self.assertIn("Data", result.sheetnames)
+                self.assertIn("Diğer", result.sheetnames)
+                self.assertNotIn("Grup A", result.sheetnames)
+                summary = result[cfg["SUMMARY_SHEET"]]
+                self.assertIn("Kaynak Excel sayfası", summary["A3"].value)
+                self.assertEqual(summary["A41"].value, "KAYNAK SAYFA BAZINDA ÖZET")
+                self.assertEqual(result["Data"]["A8"].value, 2)
+            finally:
+                result.close()
+
     def test_import_summary_and_disabled_layout(self):
         import openpyxl
 

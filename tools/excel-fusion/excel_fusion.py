@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Klasör bazlı, sezgisel başlık eşleştirmeli Excel birleştirme ve raporlama.
+"""Klasör veya kaynak sayfa bazlı, sezgisel başlık eşleştirmeli Excel raporlama.
 
 Python 3.11+
 Kurulum: python -m pip install -r requirements.txt
@@ -43,6 +43,12 @@ CONFIG: dict[str, Any] = {
     "OUTPUT_FILE": SCRIPT_DIR / "ciktilar" / "Ana_Rapor.xlsx",
     "OVERWRITE": False,                 # True: mevcut çıktı raporunu yeniler.
 
+    # Ana rapor sayfalarının hangi kaynağa göre gruplanacağı:
+    # subfolder: mevcut davranış; kök altındaki ilk düzey klasör -> rapor sayfası.
+    # sheet_name: tüm alt klasörler ve kökteki Excel'ler taranır; aynı adlı kaynak
+    #             sayfalar farklı dosyalarda olsalar da tek rapor sayfasında birleştirilir.
+    "REPORT_GROUP_MODE": "subfolder",
+
     # Kaynaklarda beklenen başlık satırı. Satır numaraları Excel gibi 1'den başlar.
     "EXPECTED_HEADER_ROW": 12,
     "HEADER_SEARCH_START": 1,           # Kaymış başlıklar için tarama başlangıcı.
@@ -72,8 +78,8 @@ CONFIG: dict[str, Any] = {
     # Bilinmeyen sütunlarda fuzzy birleştirme YAPILMAZ; bunun için COLUMN_SCHEMA'ya ekleyin.
     "EXTRA_PREFIX": "Ek | ",
 
-    # Kök klasörde doğrudan duran Excel'ler klasör->sheet kuralına girmez.
-    # True yaparsanız bunlar ayrıca "Kök Dosyalar" sayfasında toplanır.
+    # Yalnızca subfolder modunda: kökteki Excel'leri ayrı bir grupta toplar.
+    # sheet_name modunda kökteki Excel'ler bu ayardan bağımsız olarak taranır.
     "INCLUDE_ROOT_FILES": False,
     "ROOT_GROUP_NAME": "Kök Dosyalar",
     "EXTENSIONS": (".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".xlsb"),
@@ -85,6 +91,7 @@ CONFIG: dict[str, Any] = {
     # Veriyi sessizce silmemek için elenen DOLU satırlar Karantina'ya kaydedilir.
     "MIN_ROW_VALUES": 2,               # Bir veri satırında en az iki dolu hücre.
     "ROW_REQUIRE_ANY": ("No.", "Entity", "Panel", "ATA", "Reviewer Name"),
+    # None: sütun değeri yerine kaynak Excel satır numarası sanal kayıt ID'sidir.
     "ROW_ID_COLUMN": "No.",
     "ROW_ID_REGEX": None,              # Örnek: r"^\d+(?:\.\d+)?$"; None: ID zorlanmaz.
     "FOOTER_LABELS": ("total", "grand total", "toplam", "genel toplam",
@@ -116,7 +123,8 @@ CONFIG: dict[str, Any] = {
         # Yalnızca açık kayıtta: My Company boşsa bizde, doluysa diğer şirkette.
         # Eksik sütun/okunamayan formül ile bilinmeyen durum ayrı sayılır.
     },
-    # Başlık adı COLUMN_SCHEMA'daki standart ad olmalıdır. Klasör özel boyuttur.
+    # Başlık adı COLUMN_SCHEMA'daki standart ad olmalıdır. Klasör özel boyuttur;
+    # sheet_name modunda bu boyut kaynak sayfa gruplarını gösterir.
     "CHARTS": (("Klasör", "bar"), ("ATA", "column"),
                ("Panel", "doughnut"), ("Reviewer Name", "bar")),
     "MAX_ROWS_PER_SHEET": 1_048_000,     # Büyük gruplar Grup, Grup (2)... diye bölünür.
@@ -170,6 +178,7 @@ PALETTE = {
 
 LOG = logging.getLogger("excel_rapor")
 REPORT_MARKER = "FolderExcelReport-v1"
+REPORT_GROUP_MODES = ("subfolder", "sheet_name")
 META_COLUMNS = ("Kaynak Dosya", "Kaynak Sayfa", "Kaynak Satır")
 MISSING_FORMULA_PREFIX = "[FORMÜL SONUCU OKUNAMADI]"
 AUX_SHEETS = ("Denetim", "Başlık Eşleştirmeleri", "Karantina", "_Rapor Verisi")
@@ -231,6 +240,7 @@ class Report:
     root: Path
     output: Path
     groups: list[Group] = field(default_factory=list)
+    source_files: list[Path] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     mappings: list[dict[str, Any]] = field(default_factory=list)
     quarantine: list[dict[str, Any]] = field(default_factory=list)
@@ -438,6 +448,9 @@ class HeaderMatcher:
 
 def validate(cfg: dict[str, Any], schema: Sequence[ColumnSpec]) -> None:
     names = [s.name for s in schema]
+    group_mode = cfg.get("REPORT_GROUP_MODE", "subfolder")
+    if group_mode not in REPORT_GROUP_MODES:
+        raise ValueError("REPORT_GROUP_MODE: subfolder veya sheet_name olmalı.")
     if not names or len(set(n.casefold() for n in names)) != len(names):
         raise ValueError("COLUMN_SCHEMA boş veya standart sütun adları tekrarlı.")
     reserved = {normalize(n) for n in (*META_COLUMNS, "Alan Doluluğu")}
@@ -488,8 +501,8 @@ def validate(cfg: dict[str, Any], schema: Sequence[ColumnSpec]) -> None:
             raise ValueError(f"Desteklenmeyen grafik: {kind}")
     if cfg["ROW_ID_REGEX"]:
         re.compile(cfg["ROW_ID_REGEX"])
-    if cfg["ROW_ID_COLUMN"] not in names:
-        raise ValueError("ROW_ID_COLUMN tanımlı bir standart sütun olmalı.")
+    if cfg["ROW_ID_COLUMN"] is not None and cfg["ROW_ID_COLUMN"] not in names:
+        raise ValueError("ROW_ID_COLUMN, None veya tanımlı bir standart sütun olmalı.")
     validate_workflow_config(cfg, names)
 
 
@@ -596,19 +609,21 @@ def register_header(header: Header, group: Group, report: Report, file: str, she
     return mapping
 
 
-def rejection_reason(data: dict[str, Any], cfg: dict[str, Any]) -> str | None:
+def rejection_reason(data: dict[str, Any], cfg: dict[str, Any], row_number: int) -> str | None:
     filled = [v for v in data.values() if usable_value(v)]
     if not filled:
         return "FORMÜL_SONUCU_YOK" if any(nonempty(v) for v in data.values()) else "BOŞ"
-    row_id = data.get(cfg["ROW_ID_COLUMN"])
-    footer_probe = row_id if usable_value(row_id) else filled[0]
+    row_id_column = cfg["ROW_ID_COLUMN"]
+    row_id = row_number if row_id_column is None else data.get(row_id_column)
+    # Sanal satır numarası alt bilgi etiketi taşıyamaz; bu durumda ilk dolu alanı tara.
+    footer_probe = row_id if row_id_column is not None and usable_value(row_id) else filled[0]
     if normalize(str(footer_probe)) in {normalize(s) for s in cfg["FOOTER_LABELS"]}:
         return "ALT_BİLGİ/TOPLAM"
     if len(filled) < cfg["MIN_ROW_VALUES"]:
         return "AZ_DOLU_ALAN"
     if cfg["ROW_REQUIRE_ANY"] and not any(usable_value(data.get(k)) for k in cfg["ROW_REQUIRE_ANY"]):
         return "ANAHTAR_ALAN_YOK"
-    if cfg["ROW_ID_REGEX"] and not re.fullmatch(cfg["ROW_ID_REGEX"], str(data.get(cfg["ROW_ID_COLUMN"], ""))):
+    if cfg["ROW_ID_REGEX"] and not re.fullmatch(cfg["ROW_ID_REGEX"], str(row_id)):
         return "KAYIT_NO_BİÇİMİ"
     return None
 
@@ -649,9 +664,13 @@ def extract_sheet(rows: Iterable[SourceRow], group: Group, report: Report, file:
     while window:
         row = window[0]
         # Normal sayısal kayıtlar için pahalı başlık aramasını tekrar çalıştırmayın.
-        id_index = next((i for i, name in mapping.items() if name == cfg["ROW_ID_COLUMN"]), None)
+        id_column = cfg["ROW_ID_COLUMN"]
+        id_index = next((i for i, name in mapping.items() if name == id_column), None)
         value = row.values[id_index] if id_index is not None and id_index < len(row.values) else None
-        numeric_id = usable_value(value) and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", str(value).strip())
+        # Sanal ID her zaman sayısal olacağından None durumunda bu optimizasyonu kullanmak,
+        # veri arasındaki tekrar başlıkların algılanmasını tamamen devre dışı bırakırdı.
+        numeric_id = (id_column is not None and usable_value(value)
+                      and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", str(value).strip()))
         repeated = [] if numeric_id else [matcher.candidate(list(window), 0, h) for h in cfg["HEADER_HEIGHTS"]]
         again = max((h for h in repeated if h), key=lambda h: h.quality, default=None)
         consumed = again.height if again else 1
@@ -678,7 +697,7 @@ def extract_sheet(rows: Iterable[SourceRow], group: Group, report: Report, file:
             for col, formula in row.missing_formulas:
                 report.event("WARNING", "FORMULA_CACHE_MISSING", group.name, file, sheet, row.number,
                              f"{excel_col(col)}: Hesaplanmış değer yok; formül metin olarak korundu: {formula}")
-            reason = rejection_reason(data, cfg)
+            reason = rejection_reason(data, cfg, row.number)
             if not reason and cfg["DROP_DUPLICATES"]:
                 fp = fingerprint(data, cfg["DEDUP_KEYS"])
                 if fp in group.seen:
@@ -719,6 +738,26 @@ def is_own_report(path: Path) -> bool:
         return False
 
 
+def report_group_mode(cfg: dict[str, Any]) -> str:
+    """Eski harici config sözlüklerinde mevcut klasör davranışını korur."""
+    return cfg.get("REPORT_GROUP_MODE", "subfolder")
+
+
+def group_dimension_label(cfg: dict[str, Any]) -> str:
+    return "Kaynak Sayfa" if report_group_mode(cfg) == "sheet_name" else "Klasör"
+
+
+def sheet_name_group(report: Report, sheet: str, path: Path) -> Group:
+    """Aynı adlı kaynak sayfaları büyük/küçük harf farkından bağımsız birleştirir."""
+    group = next((item for item in report.groups if item.name.casefold() == sheet.casefold()), None)
+    if group is None:
+        group = Group(sheet)
+        report.groups.append(group)
+    if path not in group.files:
+        group.files.append(path)
+    return group
+
+
 def discover(report: Report, cfg: dict[str, Any]) -> None:
     def acceptable(path: Path) -> bool:
         if path.suffix.lower() not in cfg["EXTENSIONS"]:
@@ -737,6 +776,17 @@ def discover(report: Report, cfg: dict[str, Any]) -> None:
         report.event("ERROR", "DIRECTORY_READ_FAILED", file=str(exc.filename), detail=str(exc))
 
     roots = sorted(report.root.iterdir(), key=lambda p: p.name.casefold())
+    if report_group_mode(cfg) == "sheet_name":
+        for folder, subdirs, filenames in os.walk(report.root, followlinks=False, onerror=walk_error):
+            subdirs[:] = sorted((name for name in subdirs
+                                 if name not in cfg["EXCLUDE_DIRS"]
+                                 and not (Path(folder) / name).is_symlink()), key=str.casefold)
+            report.source_files.extend(Path(folder) / name
+                                       for name in sorted(filenames, key=str.casefold)
+                                       if acceptable(Path(folder) / name))
+        report.source_files.sort(key=lambda path: str(path.relative_to(report.root)).casefold())
+        return
+
     for directory in roots:
         if not directory.is_dir() or directory.is_symlink() or directory.name in cfg["EXCLUDE_DIRS"]:
             continue
@@ -803,7 +853,7 @@ def ooxml_rows(formula_sheet: Any, value_sheet: Any) -> Iterator[SourceRow]:
         yield SourceRow(number, data, formats, missing)
 
 
-def read_ooxml(path: Path, group: Group, report: Report, matcher: HeaderMatcher,
+def read_ooxml(path: Path, group: Group | None, report: Report, matcher: HeaderMatcher,
                 cfg: dict[str, Any]) -> None:
     # İçe aktarımlar geciktirilir: çekirdek testleri Excel kütüphaneleri olmadan çalışır.
     from contextlib import ExitStack
@@ -817,18 +867,21 @@ def read_ooxml(path: Path, group: Group, report: Report, matcher: HeaderMatcher,
         stack.callback(vw.close)
         for fs in fw.worksheets:
             if not sheet_allowed(fs.title, fs.sheet_state == "visible", cfg):
-                report.event("INFO", "SHEET_EXCLUDED", group.name, relative, fs.title,
+                report.event("INFO", "SHEET_EXCLUDED", group.name if group else fs.title,
+                             relative, fs.title,
                              detail="Gizlilik/sayfa adı filtresi nedeniyle dışlandı.")
                 continue
-            process_rows(ooxml_rows(fs, vw[fs.title]), group, report, relative, fs.title, matcher, cfg)
+            target_group = group or sheet_name_group(report, fs.title, path)
+            process_rows(ooxml_rows(fs, vw[fs.title]), target_group, report,
+                         relative, fs.title, matcher, cfg)
 
 
-def read_legacy(path: Path, group: Group, report: Report, matcher: HeaderMatcher,
+def read_legacy(path: Path, group: Group | None, report: Report, matcher: HeaderMatcher,
                 cfg: dict[str, Any]) -> None:
     from python_calamine import CalamineWorkbook, SheetTypeEnum, SheetVisibleEnum
 
     relative = str(path.relative_to(report.root))
-    report.event("WARNING", "LEGACY_VALUE_MODE", group.name, relative,
+    report.event("WARNING", "LEGACY_VALUE_MODE", group.name if group else "", relative,
                  detail="XLS/XLSB değer modunda okunuyor. Formül önbelleği eksikliği ve özel sayı "
                         "gösterimleri hücre bazında doğrulanamaz; kritik kaynakları XLSX olarak kaydedin.")
     with CalamineWorkbook.from_path(str(path)) as workbook:
@@ -837,31 +890,42 @@ def read_legacy(path: Path, group: Group, report: Report, matcher: HeaderMatcher
                 continue
             name = metadata.name
             if not sheet_allowed(name, metadata.visible == SheetVisibleEnum.Visible, cfg):
-                report.event("INFO", "SHEET_EXCLUDED", group.name, relative, name,
+                report.event("INFO", "SHEET_EXCLUDED", group.name if group else name,
+                             relative, name,
                              detail="Gizlilik/sayfa adı filtresi nedeniyle dışlandı.")
                 continue
+            target_group = group or sheet_name_group(report, name, path)
             # skip_empty_area=False kritik: 12. satırın gerçek Excel numarası korunur.
             def row_stream(sheet_name: str = name) -> Iterator[SourceRow]:
                 raw = workbook.get_sheet_by_name(sheet_name).to_python(skip_empty_area=False)
                 for n, values in enumerate(raw, 1):
                     yield SourceRow(n, list(values))
-            process_rows(row_stream(), group, report, relative, name, matcher, cfg)
+            process_rows(row_stream(), target_group, report, relative, name, matcher, cfg)
 
 
 def collect(report: Report, cfg: dict[str, Any], schema: Sequence[ColumnSpec]) -> None:
     matcher = HeaderMatcher(schema, cfg)
-    for group in report.groups:
-        if not group.files:
-            report.event("WARNING", "EMPTY_GROUP", group.name, detail="Bu ana klasörde kaynak Excel bulunamadı.")
-        for path in group.files:
-            relative = str(path.relative_to(report.root))
-            LOG.info("Okunuyor: %s", relative)
-            try:
-                reader = read_legacy if path.suffix.lower() in (".xls", ".xlsb") else read_ooxml
-                reader(path, group, report, matcher, cfg)
-            except Exception as exc:
-                report.event("ERROR", "FILE_READ_FAILED", group.name, relative,
-                             detail=f"{type(exc).__name__}: {exc}")
+
+    def collect_file(path: Path, group: Group | None) -> None:
+        relative = str(path.relative_to(report.root))
+        LOG.info("Okunuyor: %s", relative)
+        try:
+            reader = read_legacy if path.suffix.lower() in (".xls", ".xlsb") else read_ooxml
+            reader(path, group, report, matcher, cfg)
+        except Exception as exc:
+            report.event("ERROR", "FILE_READ_FAILED", group.name if group else "", relative,
+                         detail=f"{type(exc).__name__}: {exc}")
+
+    if report_group_mode(cfg) == "sheet_name":
+        for path in report.source_files:
+            collect_file(path, None)
+    else:
+        for group in report.groups:
+            if not group.files:
+                report.event("WARNING", "EMPTY_GROUP", group.name,
+                             detail="Bu ana klasörde kaynak Excel bulunamadı.")
+            for path in group.files:
+                collect_file(path, group)
     if not any(g.records for g in report.groups):
         report.event("WARNING", "NO_DATA", detail="Hiçbir veri kaydı birleştirilemedi; başlık eşiklerini/Denetim'i inceleyin.")
 
@@ -1140,15 +1204,15 @@ def make_chart(workbook: Any, helper: Any, start_row: int, dimension: str, kind:
 
 
 def write_workflow_summary(ws: Any, report: Report, settings: dict[str, Any],
-                           formats: dict[str, Any]) -> None:
-    """Genel ve klasör bazındaki durum/sıra sayılarını dashboard'a yazar."""
+                           formats: dict[str, Any], group_label: str) -> None:
+    """Genel ve rapor grubu bazındaki durum/sıra sayılarını dashboard'a yazar."""
     per_group = [(group.name, workflow_counts(group.records, settings)) for group in report.groups]
     totals: Counter[str] = Counter()
     for _, counts in per_group:
         totals.update(counts)
     ws.merge_range(11, 0, 11, 19, "AÇIK / KAPALI VE İŞ SIRASI", formats["section"])
     spans = [(0, 4), (5, 6), (7, 8), (9, 11), (12, 14), (15, 17), (18, 19)]
-    labels = ["Klasör", "Açık", "Kapalı", "Sıra bizde", "Sıra diğer şirkette",
+    labels = [group_label, "Açık", "Kapalı", "Sıra bizde", "Sıra diğer şirkette",
               "Durum belirsiz", "Sıra belirsiz (açık)"]
     keys = ("open", "closed", "our_company", "other_company", "unknown_status", "unknown_turn")
     for (first, last), label in zip(spans, labels):
@@ -1171,6 +1235,13 @@ def write_workflow_summary(ws: Any, report: Report, settings: dict[str, Any],
 def write_dashboard(workbook: Any, ws: Any, helper: Any, report: Report,
                     cfg: dict[str, Any], schema: Sequence[ColumnSpec], formats: dict[str, Any]) -> None:
     stats = group_stats(report, schema)
+    group_label = group_dimension_label(cfg)
+    processed_files = len({file for group in report.groups for file in group.read_files})
+    found_files = (len(report.source_files) if report_group_mode(cfg) == "sheet_name"
+                   else sum(item["found"] for item in stats))
+    grouping_text = ("Kaynak Excel sayfası → rapor sayfası"
+                     if report_group_mode(cfg) == "sheet_name"
+                     else "İlk düzey klasör → rapor sayfası")
     total = sum(s["records"] for s in stats)
     errors = sum(e["Seviye"] == "ERROR" for e in report.events)
     warnings = sum(e["Seviye"] == "WARNING" for e in report.events)
@@ -1188,11 +1259,12 @@ def write_dashboard(workbook: Any, ws: Any, helper: Any, report: Report,
     ws.set_row(1, 29)
     ws.merge_range("A1:T2", cfg["REPORT_TITLE"], formats["title"])
     ws.merge_range("A3:T3", f"Üretim: {report.generated_at:%d.%m.%Y %H:%M}  |  "
-                   "İlk düzey klasör → rapor sayfası  |  Grafikte en yoğun kategoriler ve kalanların toplamı",
+                   f"{grouping_text}  |  Grafikte en yoğun kategoriler ve kalanların toplamı",
                    formats["subtitle"])
     # Yardımcı giriş verileri: Python'un oluşturduğu rapor anı istatistikleri.
-    metrics = [("Kayıt", total), ("İşlenen dosya", sum(s["files"] for s in stats)),
-               ("Ana klasör", len(stats)), ("Uyarı + hata", warnings + errors),
+    group_metric_label = "Kaynak sayfa" if report_group_mode(cfg) == "sheet_name" else "Ana klasör"
+    metrics = [("Kayıt", total), ("İşlenen dosya", processed_files),
+               (group_metric_label, len(stats)), ("Uyarı + hata", warnings + errors),
                ("Dolu standart alan", filled), ("Olası standart alan", possible),
                ("Karantina", len(report.quarantine))]
     helper.write_row(0, 3, ["Gösterge", "Rapor anındaki değer"], formats["header"])
@@ -1218,22 +1290,25 @@ def write_dashboard(workbook: Any, ws: Any, helper: Any, report: Report,
     ws.merge_range("A10:T10", message, formats[style])
     ws.set_row(9, 29)
     if workflow["ENABLED"]:
-        write_workflow_summary(ws, report, workflow, formats)
+        write_workflow_summary(ws, report, workflow, formats, group_label)
     positions = [(12, 0), (12, 10), (26, 0), (26, 10)]
     for i, (dimension, kind) in enumerate(cfg["CHARTS"]):
         categories = top_categories(category_counts(report, dimension), cfg["DASHBOARD_TOP_N"])
+        chart_label = group_label if dimension == "Klasör" else dimension
         r, c = positions[i]
         r += workflow_offset
         if categories:
             chart = make_chart(workbook, helper, 12 + i * (cfg["DASHBOARD_TOP_N"] + 5),
-                               dimension, kind, categories, i, formats)
+                               chart_label, kind, categories, i, formats)
             ws.insert_chart(r, c, chart, {"x_offset": 3, "y_offset": 3})
         else:
-            ws.merge_range(r, c, r + 11, c + 8, f"{dimension}\nGrafik için veri bulunamadı.", formats["subtitle"])
+            ws.merge_range(r, c, r + 11, c + 8,
+                           f"{chart_label}\nGrafik için veri bulunamadı.", formats["subtitle"])
     ws.merge_range(40 + workflow_offset, 0, 40 + workflow_offset, 19,
-                   "KLASÖR BAZINDA ÖZET", formats["section"])
+                   f"{group_label.upper()} BAZINDA ÖZET", formats["section"])
     spans = [(0, 4), (5, 6), (7, 8), (9, 10), (11, 13), (14, 16), (17, 19)]
-    labels = ["Klasör / Sayfa", "Dosya", "Sayfa", "Kayıt", "Alan doluluğu", "Uyarı + hata", "Karantina"]
+    first_label = "Kaynak Sayfa / Rapor Sayfası" if report_group_mode(cfg) == "sheet_name" else "Klasör / Sayfa"
+    labels = [first_label, "Dosya", "Sayfa", "Kayıt", "Alan doluluğu", "Uyarı + hata", "Karantina"]
     for (c1, c2), label in zip(spans, labels):
         ws.merge_range(42 + workflow_offset, c1, 42 + workflow_offset, c2, label, formats["header"])
     ws.set_row(42 + workflow_offset, 32)
@@ -1251,7 +1326,7 @@ def write_dashboard(workbook: Any, ws: Any, helper: Any, report: Report,
     end = 44 + len(stats) + workflow_offset
     completeness = filled / possible if possible else 0
     ws.merge_range(end, 0, end, 19,
-                   f"Genel alan doluluğu: {completeness:.1%}  |  Taranan dosya: {sum(s['found'] for s in stats)}  |  "
+                   f"Genel alan doluluğu: {completeness:.1%}  |  Taranan dosya: {found_files}  |  "
                    f"Karantina: {len(report.quarantine)}  |  Hata: {errors}", formats["section"])
     ws.merge_range(end + 2, 0, end + 3, 19,
                    "Alan doluluğu = dolu standart hücre / (kayıt × tanımlı standart sütun). Bu değer doğruluk puanı değildir. "
@@ -1276,7 +1351,9 @@ def render_report(workbook: Any, report: Report, cfg: dict[str, Any], schema: Se
     # Hiperlinklerde sanitizasyondan sonraki gerçek adı kullan.
     local_cfg = {**cfg, "SUMMARY_SHEET": summary}
     ws = workbook.add_worksheet(summary)  # MUTLAKA İLK SAYFA.
-    workbook.set_properties({"title": cfg["REPORT_TITLE"], "subject": "Klasör bazlı konsolide rapor",
+    subject = ("Kaynak sayfa bazlı konsolide rapor" if report_group_mode(cfg) == "sheet_name"
+               else "Klasör bazlı konsolide rapor")
+    workbook.set_properties({"title": cfg["REPORT_TITLE"], "subject": subject,
                              "author": "Excel Raporlama", "comments": "Kaynak dosyalar değiştirilmemiştir."})
     workbook.set_custom_property("ReportGenerator", REPORT_MARKER)
     write_group_sheets(workbook, report, local_cfg, schema, formats, used)
@@ -1365,9 +1442,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeError(f"{errors} kaynak hatası nedeniyle çıktı üretilmedi. Denetim: {audit}")
         if not args.dry_run:
             save_report(report, cfg, COLUMN_SCHEMA)
-        LOG.info("%s | %s kayıt | %s ana klasör | %s hata | JSONL: %s",
+        LOG.info("%s | %s kayıt | %s %s | %s hata | JSONL: %s",
                  "Ön kontrol tamamlandı" if args.dry_run else f"Rapor hazır: {output}",
-                 sum(len(g.records) for g in report.groups), len(report.groups), errors, audit)
+                 sum(len(g.records) for g in report.groups), len(report.groups),
+                 group_dimension_label(cfg).casefold(), errors, audit)
         return 2 if errors else 0
     except KeyboardInterrupt:
         print("İşlem kullanıcı tarafından durduruldu.", file=sys.stderr)
