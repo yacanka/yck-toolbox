@@ -122,6 +122,63 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(any(event["Kod"] == "REPEATED_HEADER" for event in report.events))
 
 
+class QuarantineTests(unittest.TestCase):
+    def extract(self, values, **overrides):
+        cfg = copy.deepcopy(fusion.CONFIG)
+        cfg.update(EXPECTED_HEADER_ROW=1, HEADER_HEIGHTS=(1,), MIN_ROW_VALUES=1,
+                   ROW_REQUIRE_ANY=())
+        cfg.update(overrides)
+        # Özel şema, kontrolün global COLUMN_SCHEMA'ya bağlı olmadığını doğrular.
+        schema = [*fusion.COLUMN_SCHEMA, fusion.ColumnSpec("Custom")]
+        rows = [fusion.SourceRow(1, ["No.", "Entity", "Panel", "Custom", "Notes"])]
+        rows.extend(fusion.SourceRow(number, value) for number, value in enumerate(values, 2))
+        group = fusion.Group("Test")
+        report = fusion.Report(Path("."), Path("report.xlsx"))
+        matcher = fusion.HeaderMatcher(schema, cfg)
+        self.assertTrue(fusion.extract_sheet(rows, group, report, "source.xlsx", "Data",
+                                            matcher, cfg))
+        return group, report
+
+    def test_extra_only_rows_are_quarantined(self):
+        for value in (None, "", " \t\n", fusion.MISSING_FORMULA_PREFIX + " =A1"):
+            with self.subTest(value=value):
+                group, report = self.extract([[value, None, None, None, "note", "unnamed"]])
+                self.assertEqual(group.records, [])
+                self.assertEqual(len(report.quarantine), 1)
+                rejected = report.quarantine[0]
+                self.assertEqual(rejected["Neden"], "STANDART_ALAN_YOK")
+                self.assertEqual(rejected["Satır"], 2)
+                self.assertIn("unnamed", rejected["Ham Satır"])
+                self.assertIn("note", rejected["Eşlenen Veri"])
+
+    def test_one_schema_value_including_zero_and_false_is_sufficient(self):
+        for value in ("text", 0, False):
+            with self.subTest(value=value):
+                group, report = self.extract([[None, None, None, value]])
+                self.assertEqual(len(group.records), 1)
+                self.assertEqual(group.records[0].values["Custom"], value)
+                self.assertEqual(report.quarantine, [])
+
+    def test_fill_down_cannot_rescue_extra_only_row_and_resets_at_quarantine(self):
+        group, report = self.extract([
+            [1, "E", "P"],
+            [None, None, None, None, "note"],
+            [2, None, "P"],
+        ], FILL_DOWN_COLUMNS=("Entity",))
+        self.assertEqual([record.row for record in group.records], [2, 4])
+        self.assertIsNone(group.records[1].values["Entity"])
+        self.assertEqual(report.quarantine[0]["Neden"], "STANDART_ALAN_YOK")
+
+    def test_existing_rules_and_empty_row_behavior_are_preserved(self):
+        group, report = self.extract([
+            [None, " ", None],
+            [1],
+            [2, "E"],
+        ], MIN_ROW_VALUES=2)
+        self.assertEqual(len(group.records), 1)
+        self.assertEqual([row["Neden"] for row in report.quarantine], ["AZ_DOLU_ALAN"])
+
+
 class WorkbookTests(unittest.TestCase):
     @staticmethod
     def create_source(path, sheets):

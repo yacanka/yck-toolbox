@@ -1,7 +1,7 @@
 # Excel Fusion
 
 Excel kaynaklarını birleştiren mevcut motorun Türkçe masaüstü arayüzü.
-`excel_fusion.py` değiştirilmeden kullanılır; komut satırı davranışı korunur.
+Arayüz ve komut satırı aynı `excel_fusion.py` raporlama motorunu kullanır.
 
 ## Çalıştırma
 
@@ -34,6 +34,12 @@ Kaynak dosyalar değiştirilmez. Var olan kaynak Excel'in üzerine yazılamaz.
 Bu dosyalar kaynak verileri içerebilir; raporla aynı erişim kurallarıyla saklayın.
 İşlem sürerken yeni işlem başlatma ve pencere kapatma engellenir. Zorla iptal düğmesi yoktur.
 Arayüz ayarları oturumluk kullanılır; kullanıcı yolları ayrıca kaydedilmez.
+
+`COLUMN_SCHEMA` içinde tanımlanan sütunların hiçbirinde kullanılabilir veri olmayan dolu
+satırlar `STANDART_ALAN_YOK` nedeniyle karantinaya alınır. Ek veya başlıksız sütunlardaki
+veriler bu koşulu sağlamaz; kontrol üst satırdan doldurmadan önce yapılır. Boş metin,
+yalnızca boşluk ve sonucu okunamayan formül veri sayılmaz; `0` ve `False` veri sayılır.
+Tamamen boş satırlar atlanır. Diğer karantina kuralları ayrıca uygulanmaya devam eder.
 
 ## Windows EXE paketleme
 
@@ -93,7 +99,7 @@ Kaynaklar: [PyInstaller çalışma modeli](https://pyinstaller.org/en/stable/ope
 
 ## Dosya yapısı ve doğrulama
 
-- `excel_fusion.py`: mevcut raporlama motoru; değiştirilmedi.
+- `excel_fusion.py`: sütun eşleştirme, karantina ve raporlama motoru.
 - `fusion_service.py`: ayar/yol doğrulaması ve motor çağrıları. `CONFIG` değiştirilmez.
 - `excel_fusion_gui.py`: Tkinter kabuğu; tek işçi thread, kuyruk üzerinden UI güncellemeleri.
 - `fusion_smoke.py`: paket içindeki Tk penceresi açıldıktan sonra Excel doğrulaması.

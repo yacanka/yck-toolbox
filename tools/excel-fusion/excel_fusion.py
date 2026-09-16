@@ -89,6 +89,7 @@ CONFIG: dict[str, Any] = {
     "INCLUDE_HIDDEN_SHEETS": True,      # Varsayılan: gizli veri sayfaları da taranır.
 
     # Veriyi sessizce silmemek için elenen DOLU satırlar Karantina'ya kaydedilir.
+    # COLUMN_SCHEMA alanlarının tümü boşsa ek sütunlar/dolgu satırı kurtarmaz.
     "MIN_ROW_VALUES": 2,               # Bir veri satırında en az iki dolu hücre.
     "ROW_REQUIRE_ANY": ("No.", "Entity", "Panel", "ATA", "Reviewer Name"),
     # None: sütun değeri yerine kaynak Excel satır numarası sanal kayıt ID'sidir.
@@ -690,14 +691,17 @@ def extract_sheet(rows: Iterable[SourceRow], group: Group, report: Report, file:
             data = {target: source_text(row.values[i] if i < len(row.values) else None,
                                        row.formats[i] if i < len(row.formats) else "", cfg)
                     for i, target in mapping.items()}
+            # Kaynakta standart alanı olmayan satırı üstten dolgu ile kayda dönüştürme.
+            has_schema_value = any(usable_value(data.get(spec.name)) for spec in matcher.schema)
             # Dolgu bilinçli olarak opt-in. Boş satır/başlık/karantina sınırında sıfırlanır.
             for key in cfg["FILL_DOWN_COLUMNS"]:
-                if not nonempty(data.get(key)) and key in previous:
+                if has_schema_value and not nonempty(data.get(key)) and key in previous:
                     data[key] = previous[key]
             for col, formula in row.missing_formulas:
                 report.event("WARNING", "FORMULA_CACHE_MISSING", group.name, file, sheet, row.number,
                              f"{excel_col(col)}: Hesaplanmış değer yok; formül metin olarak korundu: {formula}")
-            reason = rejection_reason(data, cfg, row.number)
+            reason = (rejection_reason(data, cfg, row.number) if has_schema_value
+                      else "STANDART_ALAN_YOK")
             if not reason and cfg["DROP_DUPLICATES"]:
                 fp = fingerprint(data, cfg["DEDUP_KEYS"])
                 if fp in group.seen:
