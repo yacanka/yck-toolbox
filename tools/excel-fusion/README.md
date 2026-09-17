@@ -130,6 +130,11 @@ Kaynaklar: [PyInstaller çalışma modeli](https://pyinstaller.org/en/stable/ope
 - `fusion_service.py`: ayar/yol doğrulaması ve motor çağrıları. `CONFIG` değiştirilmez.
 - `excel_fusion_gui.py`: Tkinter kabuğu; tek işçi thread, kuyruk üzerinden UI güncellemeleri.
 - `fusion_smoke.py`: paket içindeki Tk penceresi açıldıktan sonra Excel doğrulaması.
+- `fusion_diagnostics.py`: test ve paket kontrolü için sabit örnek ayarlar/şema.
+  Kullanıcının düzenlediği `CONFIG` ve `COLUMN_SCHEMA`, örnek verinin beklenen
+  sonuçlarını değiştirmez; kontrol bitince özgün ayarlar geri yüklenir.
+  Normal raporlarda kullanıcı ayarları geçerlidir. Paket kontrolü gerçek ayarların
+  geçerliliğini de denetler; gerçek kaynak dosyalarının uyumluluğu ayrıca kontrol edilmelidir.
 - `test_fusion_service.py`: CLI eşdeğerliği, kaynak koruması, hata ve dosya akışı testleri.
 - `build_windows.bat`, `build_windows.py`, `collect_licenses.py`: build, paket kontrolü, lisanslar ve ZIP dağıtımı.
 - `test_build_windows.py`: hata halinde durma, argüman/yol koruması, ZIP içeriği ve ölçüm testleri.

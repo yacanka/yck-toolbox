@@ -13,8 +13,12 @@ def check(destination: Path, started: float) -> None:
         import python_calamine
         import xlsxwriter
 
+        import excel_fusion as core
+        from fusion_diagnostics import sample_configuration
         from fusion_service import RunOptions, run_report
 
+        # The sample is independent of user rules, but invalid real settings still fail the build.
+        core.validate(core.CONFIG, core.COLUMN_SCHEMA)
         # Confirm the native legacy reader is present in the frozen package too.
         if not callable(python_calamine.CalamineWorkbook.from_path):
             raise TypeError("Legacy reader unavailable")
@@ -26,7 +30,8 @@ def check(destination: Path, started: float) -> None:
                 sheet = workbook.add_worksheet("Data")
                 sheet.write_row(0, 0, ["No.", "Entity", "Panel"])
                 sheet.write_row(1, 0, [1, "E1", "P1"])
-            report = run_report(RunOptions(str(source.parent), str(root / "rapor.xlsx")))
+            with sample_configuration():
+                report = run_report(RunOptions(str(source.parent), str(root / "rapor.xlsx")))
             if report.records != 1 or report.errors:
                 raise RuntimeError("Report generation failed")
             workbook = openpyxl.load_workbook(report.output, data_only=True)

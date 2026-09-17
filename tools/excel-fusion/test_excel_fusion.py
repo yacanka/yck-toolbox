@@ -9,10 +9,12 @@ import unittest
 from pathlib import Path
 
 import excel_fusion as fusion
+from fusion_diagnostics import sample_configuration
 
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(sample_configuration())
         self.cfg = copy.deepcopy(fusion.CONFIG)
         self.settings = self.cfg["WORKFLOW_SUMMARY"]
 
@@ -123,6 +125,9 @@ class WorkflowTests(unittest.TestCase):
 
 
 class QuarantineTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(sample_configuration())
+
     def extract(self, values, **overrides):
         cfg = copy.deepcopy(fusion.CONFIG)
         cfg.update(EXPECTED_HEADER_ROW=1, HEADER_HEIGHTS=(1,), MIN_ROW_VALUES=1,
@@ -213,6 +218,9 @@ class QuarantineTests(unittest.TestCase):
 
 
 class WorkbookTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(sample_configuration())
+
     @staticmethod
     def create_source(path, sheets):
         import openpyxl

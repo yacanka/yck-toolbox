@@ -9,11 +9,13 @@ from unittest.mock import patch
 import openpyxl
 
 import excel_fusion as core
+from fusion_diagnostics import sample_configuration
 from fusion_service import RunOptions, run_report, validate_paths
 
 
 class ServiceTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(sample_configuration())
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
@@ -50,6 +52,12 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(Path(self.options.output).exists())
         self.assertTrue(result.audit.is_file())
         self.assertTrue(Path(self.options.output).with_suffix(".log").is_file())
+
+    def test_user_required_columns_are_honored_by_normal_reports(self):
+        core.CONFIG["ROW_REQUIRED_COLUMNS"] = ("Notes",)
+        result = run_report(self.options)
+        self.assertEqual((result.records, result.quarantined, result.errors), (0, 1, 0))
+        self.assertEqual(core.CONFIG["ROW_REQUIRED_COLUMNS"], ("Notes",))
 
     def test_existing_output_protected_and_own_report_can_be_renewed(self):
         result = run_report(self.options)
