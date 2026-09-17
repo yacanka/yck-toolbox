@@ -24,8 +24,8 @@ def run(*args: str | Path, timeout: float | None = None) -> None:
 def validate_environment() -> None:
     if sys.platform != "win32":
         raise RuntimeError("Windows EXE must be built on Windows; this environment is unsupported.")
-    if sys.version_info[:2] != (3, 12):
-        raise RuntimeError("Install Python 3.12 x64 with Tcl/Tk support.")
+    if sys.version_info[:2] != (3, 11):
+        raise RuntimeError("Install Python 3.11 x64 with Tcl/Tk support.")
     if platform.machine().upper() not in ("AMD64", "X86_64") or struct.calcsize("P") != 8:
         raise RuntimeError("The Windows x64 Python installer is required.")
     import tkinter
@@ -73,21 +73,43 @@ def archive_bundle(bundle: Path, health: dict, elapsed: float) -> Path:
     return archive
 
 
+def install_dependencies(python: Path) -> None:
+    """Install only local wheels; never fall back to an online package index."""
+    wheelhouse = PROJECT / "wheelhouse"
+    if not wheelhouse.is_dir() or not any(wheelhouse.glob("*.whl")):
+        raise RuntimeError(
+            "Offline packages are missing. Populate wheelhouse with Python 3.11 Windows x64 "
+            "wheels for requirements-build.txt; see README.md."
+        )
+    try:
+        run(python, "-m", "pip", "--isolated", "--disable-pip-version-check", "install",
+            "--no-index", "--find-links", wheelhouse, "--only-binary=:all:",
+            "-r", "requirements-build.txt")
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Offline dependency installation failed. Check wheelhouse for all required "
+            "Python 3.11 Windows x64 wheels. No online fallback was attempted."
+        ) from exc
+
+
 def build(build_root: Path, dist: Path) -> None:
     python = Path(sys.executable)
-    run(python, "-m", "pip", "install", "-r", "requirements-build.txt")
+    install_dependencies(python)
     run(python, "-m", "unittest", "discover", "-v")
     run(python, "-m", "compileall", "-q", "excel_fusion.py", "fusion_service.py",
         "excel_fusion_gui.py", "fusion_smoke.py", "collect_licenses.py", "build_windows.py")
-    run(python, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir", "--windowed",
-        "--noupx", "--name", "ExcelFusion", "--distpath", dist,
+    bundle = dist / "ExcelFusion"
+    bundle.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(PROJECT / "README.md", bundle / "README.md")
+    run(python, "collect_licenses.py", bundle)
+    run(python, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
+        "--noupx", "--name", "ExcelFusion", "--distpath", bundle,
         "--workpath", build_root / "pyinstaller", "--specpath", build_root,
+        "--add-data", f"{bundle / 'licenses'};licenses",
+        "--add-data", f"{bundle / 'README.md'};.",
         "--exclude-module", "numpy", "--exclude-module", "pandas",
         "--exclude-module", "matplotlib", "--exclude-module", "PIL",
         "--exclude-module", "lxml", "--hidden-import", "python_calamine", "excel_fusion_gui.py")
-    bundle = dist / "ExcelFusion"
-    shutil.copyfile(PROJECT / "README.md", bundle / "README.md")
-    run(python, "collect_licenses.py", bundle)
     health, elapsed = check_bundle(bundle, dist / "smoke-result.json")
     archive_bundle(bundle, health, elapsed)
 

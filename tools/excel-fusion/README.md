@@ -5,13 +5,15 @@ Arayüz ve komut satırı aynı `excel_fusion.py` raporlama motorunu kullanır.
 
 ## Çalıştırma
 
-Python 3.12 ve Tcl/Tk gerekir. Windows'ta python.org kurulumunun Tcl/Tk seçeneği açık olmalıdır.
+Python 3.11 ve Tcl/Tk gerekir. Windows'ta python.org kurulumunun Tcl/Tk seçeneği açık olmalıdır.
 
 ```bat
-py -3.12 -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements.txt
+py -3.11 -m venv .venv
+.\.venv\Scripts\python -m pip --disable-pip-version-check install --no-index --find-links=wheelhouse --only-binary=:all: -r requirements.txt
 .\.venv\Scripts\python excel_fusion_gui.py
 ```
+
+Kurulumdan önce aşağıdaki **Offline paket hazırlığı** bölümüne göre `wheelhouse` klasörünü doldurun.
 
 macOS/Linux'ta Tk desteği olan Python ile `python3 excel_fusion_gui.py` çalıştırılabilir.
 `python -m tkinter` kurulumun pencere açabildiğini kontrol eder.
@@ -48,14 +50,14 @@ formül veri sayılmaz; `0` ve `False` veri sayılır. `()` bu ek kontrolü kapa
 
 ## Windows EXE paketleme
 
-Windows x64 üzerinde Python 3.12 kurun; Tcl/Tk seçeneğini açık tutun.
+Windows x64 üzerinde Python 3.11 kurun; Tcl/Tk seçeneğini açık tutun.
 `build_windows.bat` dosyasına çift tıklayın veya Komut İstemi (cmd.exe) üzerinden çalıştırın:
 
 ```bat
 build_windows.bat
 ```
 
-PowerShell gerekmez. BAT dosyası Python launcher (`py -3.12`) veya PATH üzerindeki
+PowerShell gerekmez. BAT dosyası Python launcher (`py -3.11`) veya PATH üzerindeki
 `python` komutunu kullanır; Python sürümü ve x64 mimarisi kontrol edilir.
 Pencere sonunda açık kalır; otomatik çalıştırmalar için `build_windows.bat --no-pause` kullanın.
 Hata halinde sıfırdan farklı çıkış kodu döner. Paketleme adımları `build_windows.py` içindedir.
@@ -63,21 +65,40 @@ Hata halinde sıfırdan farklı çıkış kodu döner. Paketleme adımları `bui
 Betik bağımsız bir build ortamı kurar, bağımlılıkları yükler, tüm testleri çalıştırır,
 PyInstaller ile konsolsuz EXE üretir. Ardından **üretilen EXE'yi** açarak Tk ve
 Excel okuma/yazma kontrolü yapar. Kontrol başarısızsa dağıtım ZIP'i oluşturmaz.
-İlk kurulum internet erişimi gerektirir; uygulama çalışırken internet veya Excel kurulumu gerekmez.
+Kurulum yalnızca proje kökündeki `wheelhouse/` klasöründen yapılır; paketler veya uyumlu
+sürümler eksikse build durur. İnternete otomatik geçiş yapılmaz. Uygulama çalışırken
+internet veya Excel kurulumu gerekmez.
 
 Çıktılar `dist/windows-<zaman>/` altındadır:
 
-- `ExcelFusion/ExcelFusion.exe`: uygulama.
-- `ExcelFusion/_internal/`: birlikte taşınması gereken Python/Tk ve Excel bağımlılıkları.
+- `ExcelFusion/ExcelFusion.exe`: Python/Tk, Excel bağımlılıkları, README ve lisansları içeren tek dosyalı uygulama.
 - `ExcelFusion/licenses/`: bağımlılık lisans bildirimleri.
 - `ExcelFusion-Windows-x64.zip`: kullanıcıya verilecek taşınabilir paket.
 - `smoke-result.json`: paketlenmiş uygulamanın kontrol sonucu.
 - `build-metrics.json`: açılmış klasör/ZIP boyutu, süreler ve ZIP SHA-256 özeti.
 
-Kullanıcı ZIP'i tamamen çıkartıp `ExcelFusion.exe` dosyasını açmalıdır.
-EXE tek başına kopyalanmamalıdır. Her build ayrı dizine yazılır; önceki dağıtımlar korunur.
+Kullanıcı ZIP'i çıkartıp `ExcelFusion.exe` dosyasını açabilir.
+EXE tek başına da kopyalanıp çalıştırılabilir; yanındaki README ve lisans klasörü inceleme kolaylığı içindir. Her build ayrı dizine yazılır; önceki dağıtımlar korunur.
 ZIP oluşturulmadan önce kurumsal dağıtım için gerekiyorsa kod imzası süreci ayrıca eklenmelidir.
 Mevcut betik imzasız taşınabilir paket üretir.
+
+### Offline paket hazırlığı
+
+İnternet erişimi olan bir **Windows x64 / Python 3.11** bilgisayarda, aynı
+`requirements.txt` ve `requirements-build.txt` dosyalarıyla bir kez çalıştırın:
+
+```bat
+py -3.11 -m pip download --only-binary=:all: --dest wheelhouse -r requirements-build.txt
+```
+
+Bu ayrı hazırlık komutu internet kullanır; build betiği indirme yapmaz.
+Oluşan `wheelhouse` klasörünü offline bilgisayarda proje köküne kopyalayın,
+ardından `build_windows.bat` çalıştırın. Dolaylı bağımlılıkların wheel dosyaları da
+klasörde bulunmalıdır; yalnızca uygulama paketlerini kopyalamak yeterli değildir.
+Gereksinimler değiştiğinde paket klasörünü de aynı dosyalara göre hazırlayın.
+Python 3.11 x64 ve Tcl/Tk hedef bilgisayara önceden kurulmuş olmalıdır.
+`wheelhouse/` Git'e eklenmez. macOS/Linux kaynak kurulumunda o platform ve Python
+sürümüne uygun wheel dosyalarını kullanın.
 
 ### Boyut ve açılış kararı
 
@@ -86,8 +107,9 @@ Mevcut XLS/XLSB desteğini korumak için `python-calamine` pakette tutulur.
 Excel kütüphaneleri işlem başladığında yüklenir. Sistem yazı tipleri kullanılır;
 font, görsel veya tarayıcı motoru indirilmez.
 
-PyInstaller **onedir** kullanılır. **onefile** her açılışta içeriğini geçici klasöre açtığı için
-açılış gecikmesi ekler. ZIP dağıtım boyutunu küçültür; kullanıcı bir kez açar.
+PyInstaller **onefile** kullanılır. Python/Tk ve bağımlılıklar EXE içindedir;
+her açılışta geçici klasöre çıkarılır. Bu işlem açılış gecikmesi ekler ve geçici
+klasörde yazma izni/boş alan gerektirir. ZIP, EXE ile okunabilir lisans bildirimlerini birlikte sunar.
 UPX eklenmez. Boyut ve hız için doğrulanmamış bir MB/saniye garantisi verilmez;
 betik gerçek paket üzerinden ölçer.
 

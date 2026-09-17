@@ -3,9 +3,9 @@ setlocal DisableDelayedExpansion
 pushd "%~dp0"
 if errorlevel 1 exit /b 1
 
-py -3.12 -c "import sys" >nul 2>&1
+py -3.11 -c "import sys" >nul 2>&1
 if errorlevel 1 goto use_python
-py -3.12 build_windows.py
+py -3.11 build_windows.py
 goto finished
 
 :use_python
@@ -15,7 +15,7 @@ python build_windows.py
 goto finished
 
 :missing_python
-echo Python bulunamadi. Python 3.12 x64 kurun; Tcl/Tk ve PATH seceneklerini etkinlestirin.
+echo Python bulunamadi. Python 3.11 x64 kurun; Tcl/Tk ve PATH seceneklerini etkinlestirin.
 set "build_exit=1"
 goto cleanup
 

@@ -3,7 +3,7 @@
 """Klasör veya kaynak sayfa bazlı, sezgisel başlık eşleştirmeli Excel raporlama.
 
 Python 3.11+
-Kurulum: python -m pip install -r requirements.txt
+Kurulum: python -m pip install --no-index --find-links=wheelhouse --only-binary=:all: -r requirements.txt
 Çalıştırma: python excel_rapor.py --input "C:\\Veriler" --output "C:\\Raporlar\\Ana.xlsx"
 
 Kaynak dosyalar DEĞİŞTİRİLMEZ. Çıktı, verilerin rapor üretim anındaki görüntüsüdür.
