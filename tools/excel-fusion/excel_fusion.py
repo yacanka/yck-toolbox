@@ -89,7 +89,10 @@ CONFIG: dict[str, Any] = {
     "INCLUDE_HIDDEN_SHEETS": True,      # Varsayılan: gizli veri sayfaları da taranır.
 
     # Veriyi sessizce silmemek için elenen DOLU satırlar Karantina'ya kaydedilir.
-    # COLUMN_SCHEMA alanlarının tümü boşsa ek sütunlar/dolgu satırı kurtarmaz.
+    # Bağımsız ve öncelikli kontrol: listedeki HER sütun dolu olmalıdır.
+    # Kaynak başlığı veya standart çıktı adı; COLUMN_SCHEMA'da bulunması gerekmez.
+    # Eksik başlık da boş kabul edilir. Dolgudan önce uygulanır; () kontrolü kapatır.
+    "ROW_REQUIRED_COLUMNS": (),        # Örnek: ("Entity", "Notes")
     "MIN_ROW_VALUES": 2,               # Bir veri satırında en az iki dolu hücre.
     "ROW_REQUIRE_ANY": ("No.", "Entity", "Panel", "ATA", "Reviewer Name"),
     # None: sütun değeri yerine kaynak Excel satır numarası sanal kayıt ID'sidir.
@@ -474,6 +477,10 @@ def validate(cfg: dict[str, Any], schema: Sequence[ColumnSpec]) -> None:
         missing = set(cfg[key]) - set(names)
         if missing:
             raise ValueError(f"{key} içinde tanımsız sütun var: {missing}")
+    required_columns = cfg.get("ROW_REQUIRED_COLUMNS", ())
+    if (not isinstance(required_columns, (list, tuple))
+            or any(not isinstance(name, str) or not normalize(name) for name in required_columns)):
+        raise ValueError("ROW_REQUIRED_COLUMNS dolu sütun adlarından oluşan liste veya tuple olmalı.")
     if not 1 <= cfg["MIN_HEADER_MATCHES"] <= len(names):
         raise ValueError("MIN_HEADER_MATCHES, 1 ile tanımlı sütun sayısı arasında olmalı.")
     if not 0 <= cfg["MIN_HEADER_ANCHORS"] <= len(cfg["HEADER_ANCHORS"]):
@@ -610,6 +617,19 @@ def register_header(header: Header, group: Group, report: Report, file: str, she
     return mapping
 
 
+def required_columns_reason(data: dict[str, Any], header: Header, mapping: dict[int, str],
+                            cfg: dict[str, Any]) -> str | None:
+    """Kaynak başlığı veya eşlenen adla zorunlu alanları dolgudan önce kontrol eder."""
+    for name in cfg.get("ROW_REQUIRED_COLUMNS", ()):
+        key = normalize(name)
+        targets = [mapping[item.index] for item in header.matches
+                   if key in {normalize(item.label or item.raw), normalize(item.raw),
+                              normalize(mapping[item.index])}]
+        if not any(usable_value(data.get(target)) for target in targets):
+            return "ZORUNLU_ALAN_BOŞ: " + name
+    return None
+
+
 def rejection_reason(data: dict[str, Any], cfg: dict[str, Any], row_number: int) -> str | None:
     filled = [v for v in data.values() if usable_value(v)]
     if not filled:
@@ -676,6 +696,7 @@ def extract_sheet(rows: Iterable[SourceRow], group: Group, report: Report, file:
         again = max((h for h in repeated if h), key=lambda h: h.quality, default=None)
         consumed = again.height if again else 1
         if again:
+            header = again
             mapping = register_header(again, group, report, file, sheet, cfg, matcher.schema)
             previous.clear()
             report.event("INFO", "REPEATED_HEADER", group.name, file, sheet, row.number,
@@ -691,17 +712,15 @@ def extract_sheet(rows: Iterable[SourceRow], group: Group, report: Report, file:
             data = {target: source_text(row.values[i] if i < len(row.values) else None,
                                        row.formats[i] if i < len(row.formats) else "", cfg)
                     for i, target in mapping.items()}
-            # Kaynakta standart alanı olmayan satırı üstten dolgu ile kayda dönüştürme.
-            has_schema_value = any(usable_value(data.get(spec.name)) for spec in matcher.schema)
+            reason = required_columns_reason(data, header, mapping, cfg)
             # Dolgu bilinçli olarak opt-in. Boş satır/başlık/karantina sınırında sıfırlanır.
             for key in cfg["FILL_DOWN_COLUMNS"]:
-                if has_schema_value and not nonempty(data.get(key)) and key in previous:
+                if not reason and not nonempty(data.get(key)) and key in previous:
                     data[key] = previous[key]
             for col, formula in row.missing_formulas:
                 report.event("WARNING", "FORMULA_CACHE_MISSING", group.name, file, sheet, row.number,
                              f"{excel_col(col)}: Hesaplanmış değer yok; formül metin olarak korundu: {formula}")
-            reason = (rejection_reason(data, cfg, row.number) if has_schema_value
-                      else "STANDART_ALAN_YOK")
+            reason = reason or rejection_reason(data, cfg, row.number)
             if not reason and cfg["DROP_DUPLICATES"]:
                 fp = fingerprint(data, cfg["DEDUP_KEYS"])
                 if fp in group.seen:

@@ -35,11 +35,16 @@ Bu dosyalar kaynak verileri içerebilir; raporla aynı erişim kurallarıyla sak
 İşlem sürerken yeni işlem başlatma ve pencere kapatma engellenir. Zorla iptal düğmesi yoktur.
 Arayüz ayarları oturumluk kullanılır; kullanıcı yolları ayrıca kaydedilmez.
 
-`COLUMN_SCHEMA` içinde tanımlanan sütunların hiçbirinde kullanılabilir veri olmayan dolu
-satırlar `STANDART_ALAN_YOK` nedeniyle karantinaya alınır. Ek veya başlıksız sütunlardaki
-veriler bu koşulu sağlamaz; kontrol üst satırdan doldurmadan önce yapılır. Boş metin,
-yalnızca boşluk ve sonucu okunamayan formül veri sayılmaz; `0` ve `False` veri sayılır.
-Tamamen boş satırlar atlanır. Diğer karantina kuralları ayrıca uygulanmaya devam eder.
+`CONFIG["ROW_REQUIRED_COLUMNS"]`, `COLUMN_SCHEMA` listesinden bağımsız ve öncelikli
+bir karantina kuralıdır. Örneğin `"ROW_REQUIRED_COLUMNS": ("Entity", "Notes")`
+ayarında bu iki sütunun **her biri** dolu olmalıdır; herhangi biri boşsa satır
+`ZORUNLU_ALAN_BOŞ: <sütun adı>` nedeniyle karantinaya alınır. Kaynak başlığı veya
+eşlenen çıktı adı kullanılabilir; şema dışındaki kaynak başlıkları da desteklenir.
+Başlık karşılaştırmasında mevcut harf/boşluk/noktalama normalizasyonu kullanılır.
+Kaynakta bulunmayan sütun boş kabul edilir. Kontrol üst satırdan doldurmadan ve diğer
+karantina kurallarından önce yapılır. Boş metin, yalnızca boşluk ve sonucu okunamayan
+formül veri sayılmaz; `0` ve `False` veri sayılır. `()` bu ek kontrolü kapatır
+(varsayılan). Tamamen boş satırlar atlanır; diğer karantina kuralları geçerliliğini korur.
 
 ## Windows EXE paketleme
 

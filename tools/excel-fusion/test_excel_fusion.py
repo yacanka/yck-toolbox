@@ -139,35 +139,68 @@ class QuarantineTests(unittest.TestCase):
                                             matcher, cfg))
         return group, report
 
-    def test_extra_only_rows_are_quarantined(self):
+    def test_required_empty_values_are_quarantined(self):
         for value in (None, "", " \t\n", fusion.MISSING_FORMULA_PREFIX + " =A1"):
             with self.subTest(value=value):
-                group, report = self.extract([[value, None, None, None, "note", "unnamed"]])
+                group, report = self.extract([[value, None, None, None, "note", "unnamed"]],
+                                             ROW_REQUIRED_COLUMNS=("No.",))
                 self.assertEqual(group.records, [])
                 self.assertEqual(len(report.quarantine), 1)
                 rejected = report.quarantine[0]
-                self.assertEqual(rejected["Neden"], "STANDART_ALAN_YOK")
+                self.assertEqual(rejected["Neden"], "ZORUNLU_ALAN_BOŞ: No.")
                 self.assertEqual(rejected["Satır"], 2)
                 self.assertIn("unnamed", rejected["Ham Satır"])
                 self.assertIn("note", rejected["Eşlenen Veri"])
 
-    def test_one_schema_value_including_zero_and_false_is_sufficient(self):
+    def test_required_values_include_zero_and_false(self):
         for value in ("text", 0, False):
             with self.subTest(value=value):
-                group, report = self.extract([[None, None, None, value]])
+                group, report = self.extract([[None, None, None, value]],
+                                             ROW_REQUIRED_COLUMNS=("Custom",))
                 self.assertEqual(len(group.records), 1)
                 self.assertEqual(group.records[0].values["Custom"], value)
                 self.assertEqual(report.quarantine, [])
 
-    def test_fill_down_cannot_rescue_extra_only_row_and_resets_at_quarantine(self):
+    def test_fill_down_cannot_rescue_required_cell(self):
         group, report = self.extract([
             [1, "E", "P"],
-            [None, None, None, None, "note"],
             [2, None, "P"],
-        ], FILL_DOWN_COLUMNS=("Entity",))
+            [3, "F", "P"],
+        ], FILL_DOWN_COLUMNS=("Entity",), ROW_REQUIRED_COLUMNS=("Entity",))
         self.assertEqual([record.row for record in group.records], [2, 4])
-        self.assertIsNone(group.records[1].values["Entity"])
-        self.assertEqual(report.quarantine[0]["Neden"], "STANDART_ALAN_YOK")
+        self.assertEqual(report.quarantine[0]["Neden"], "ZORUNLU_ALAN_BOŞ: Entity")
+
+    def test_required_source_column_outside_schema_and_every_column_required(self):
+        group, report = self.extract([
+            [1, "E", "P", None, "note"],
+            [2, "E", "P"],
+            [None, "E", "P", None, "note"],
+        ], ROW_REQUIRED_COLUMNS=("No.", " notes "))
+        self.assertEqual(len(group.records), 1)
+        self.assertEqual(len(report.quarantine), 2)
+
+    def test_missing_header_is_rejected_before_other_rules(self):
+        group, report = self.extract([["total", "E", "P"]],
+                                     ROW_REQUIRED_COLUMNS=("Missing",))
+        self.assertEqual(group.records, [])
+        self.assertEqual(report.quarantine[0]["Neden"], "ZORUNLU_ALAN_BOŞ: Missing")
+
+    def test_disabled_rule_allows_extra_only_row(self):
+        group, report = self.extract([[None, None, None, None, "note"]])
+        self.assertEqual(len(group.records), 1)
+        self.assertEqual(report.quarantine, [])
+
+    def test_required_columns_config_validation_and_legacy_default(self):
+        cfg = copy.deepcopy(fusion.CONFIG)
+        for value in (None, "Entity", [""], [" "], [1]):
+            with self.subTest(value=value):
+                cfg["ROW_REQUIRED_COLUMNS"] = value
+                with self.assertRaisesRegex(ValueError, "ROW_REQUIRED_COLUMNS"):
+                    fusion.validate(cfg, fusion.COLUMN_SCHEMA)
+        cfg["ROW_REQUIRED_COLUMNS"] = ["Outside schema"]
+        fusion.validate(cfg, fusion.COLUMN_SCHEMA)
+        del cfg["ROW_REQUIRED_COLUMNS"]
+        fusion.validate(cfg, fusion.COLUMN_SCHEMA)
 
     def test_existing_rules_and_empty_row_behavior_are_preserved(self):
         group, report = self.extract([
