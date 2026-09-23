@@ -271,11 +271,10 @@ int main(void) {
 #include <stdio.h>
 #include <stdlib.h>
 static BOOL failShutdownCreate, failShutdownDestroy;
+static BOOL missingShutdownCreate, missingShutdownDestroy;
 static unsigned int shutdownCreates, shutdownDestroys;
 static BOOL WINAPI TestShutdownCreate(HWND hwnd, LPCWSTR reason);
 static BOOL WINAPI TestShutdownDestroy(HWND hwnd);
-#define ShutdownBlockReasonCreate TestShutdownCreate
-#define ShutdownBlockReasonDestroy TestShutdownDestroy
 static BOOL failTimer, failExecution, failPower, failPowerCreate;
 static BOOL failStandardControls, failAllControls;
 static unsigned int controlInitCalls;
@@ -452,6 +451,39 @@ static void EnableDpiAwarenessIfSupported(void) {
         memcpy(&setProcessDPIAwareFunction, &procedureAddress, sizeof(setProcessDPIAwareFunction));
         (void)setProcessDPIAwareFunction();
     }
+}
+
+/* Old Dev-C++/MinGW import libraries may not expose these Vista APIs.
+ * Resolve them from the already-loaded system DLL, with no static imports. */
+typedef BOOL (WINAPI *AppShutdownCreateFunction)(HWND hwnd, LPCWSTR reason);
+typedef BOOL (WINAPI *AppShutdownDestroyFunction)(HWND hwnd);
+
+static FARPROC FindShutdownFunction(LPCSTR name) {
+    HMODULE module = GetModuleHandleW(L"user32.dll");
+    return module != NULL ? GetProcAddress(module, name) : NULL;
+}
+
+static BOOL AppCreateShutdownBlock(HWND hwnd, LPCWSTR reason) {
+    AppShutdownCreateFunction createBlock;
+    FARPROC address = FindShutdownFunction("ShutdownBlockReasonCreate");
+    /* Do not acquire a block when the matching release API is unavailable. */
+    if (address == NULL || FindShutdownFunction("ShutdownBlockReasonDestroy") == NULL) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+    memcpy(&createBlock, &address, sizeof(createBlock));
+    return createBlock(hwnd, reason);
+}
+
+static BOOL AppDestroyShutdownBlock(HWND hwnd) {
+    AppShutdownDestroyFunction destroyBlock;
+    FARPROC address = FindShutdownFunction("ShutdownBlockReasonDestroy");
+    if (address == NULL) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+    memcpy(&destroyBlock, &address, sizeof(destroyBlock));
+    return destroyBlock(hwnd);
 }
 
 static BOOL ApplyPowerRequestDisplayRequired(void) {
@@ -850,7 +882,7 @@ static void StartProtection(HWND hwnd) {
     }
 
     if (preventShutdown) {
-        if (!ShutdownBlockReasonCreate(hwnd,
+        if (!AppCreateShutdownBlock(hwnd,
                 L"Awaken protection is active. Stop protection in Awaken to end this session.")) {
             if (!StopProtection(hwnd)) return;
             MessageBoxW(hwnd, L"Shutdown protection could not be registered. No protection is active.",
@@ -900,7 +932,7 @@ static BOOL StopProtection(HWND hwnd) {
 
     ClearPowerRequestDisplayRequired();
     if (g_app.shutdownBlockApplied) {
-        if (!ShutdownBlockReasonDestroy(hwnd)) {
+        if (!AppDestroyShutdownBlock(hwnd)) {
             g_app.active = TRUE;
             SetConfigurationControlsEnabled(FALSE);
             SetWindowTextW(g_app.statusText, L"Shutdown protection could not be stopped");
@@ -1250,7 +1282,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                 KillTimer(hwnd, ID_TIMER_MAIN);
                 g_app.active = FALSE;
                 if (g_app.shutdownBlockApplied) {
-                    ShutdownBlockReasonDestroy(hwnd);
+                    AppDestroyShutdownBlock(hwnd);
                     g_app.shutdownBlockApplied = FALSE;
                 }
                 if (g_app.executionStateApplied) {
@@ -1264,7 +1296,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         case WM_DESTROY:
             /* Destroying the owning window also removes its shutdown reason. */
             if (g_app.shutdownBlockApplied) {
-                ShutdownBlockReasonDestroy(hwnd);
+                AppDestroyShutdownBlock(hwnd);
                 g_app.shutdownBlockApplied = FALSE;
             }
             g_app.active = FALSE;
@@ -1465,8 +1497,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
 
 #ifdef AWAKEN_WINDOWS_TEST
 
-#undef ShutdownBlockReasonCreate
-#undef ShutdownBlockReasonDestroy
 #undef MessageBoxW
 #undef SetTimer
 #undef SetThreadExecutionState
@@ -1590,6 +1620,18 @@ static BOOL WINAPI TestPowerClear(HANDLE handle, int type) {
 }
 static FARPROC WINAPI TestGetProcAddress(HMODULE module, LPCSTR name) {
     FARPROC address;
+    if (strcmp(name, "ShutdownBlockReasonCreate") == 0) {
+        AppShutdownCreateFunction function = TestShutdownCreate;
+        if (missingShutdownCreate) return NULL;
+        memcpy(&address, &function, sizeof(address));
+        return address;
+    }
+    if (strcmp(name, "ShutdownBlockReasonDestroy") == 0) {
+        AppShutdownDestroyFunction function = TestShutdownDestroy;
+        if (missingShutdownDestroy) return NULL;
+        memcpy(&address, &function, sizeof(address));
+        return address;
+    }
     if (strcmp(name, "PowerCreateRequest") == 0) {
         AppPowerCreateRequestFunction function = TestPowerCreate;
         memcpy(&address, &function, sizeof(address));
@@ -1616,12 +1658,28 @@ static void SelectOptions(BOOL sleep, BOOL display, BOOL saver) {
 
 /* Verify real API registration independently of the failure-injection stubs. */
 static void TestShutdownReasonApi(HWND hwnd) {
+    typedef BOOL (WINAPI *QueryFunction)(HWND, LPWSTR, DWORD *);
+    HMODULE module = GetModuleHandleW(L"user32.dll");
+    AppShutdownCreateFunction createBlock;
+    AppShutdownDestroyFunction destroyBlock;
+    QueryFunction queryBlock;
+    FARPROC address;
     WCHAR reason[256];
     DWORD count = ARRAYSIZE(reason);
-    CHECK(ShutdownBlockReasonCreate(hwnd, L"Awaken regression test"));
-    CHECK(ShutdownBlockReasonQuery(hwnd, reason, &count));
+    CHECK(module != NULL);
+    address = GetProcAddress(module, "ShutdownBlockReasonCreate");
+    CHECK(address != NULL);
+    memcpy(&createBlock, &address, sizeof(createBlock));
+    address = GetProcAddress(module, "ShutdownBlockReasonDestroy");
+    CHECK(address != NULL);
+    memcpy(&destroyBlock, &address, sizeof(destroyBlock));
+    address = GetProcAddress(module, "ShutdownBlockReasonQuery");
+    CHECK(address != NULL);
+    memcpy(&queryBlock, &address, sizeof(queryBlock));
+    CHECK(createBlock(hwnd, L"Awaken regression test"));
+    CHECK(queryBlock(hwnd, reason, &count));
     CHECK(wcscmp(reason, L"Awaken regression test") == 0);
-    CHECK(ShutdownBlockReasonDestroy(hwnd));
+    CHECK(destroyBlock(hwnd));
 }
 
 /* These tests send session messages only; they never shut down the test host. */
@@ -1631,6 +1689,20 @@ static void TestShutdownProtection(HWND hwnd) {
     CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) == TRUE);
     SelectOptions(FALSE, FALSE, FALSE);
     Button_SetCheck(g_app.checkShutdown, BST_CHECKED);
+    missingShutdownCreate = TRUE;
+    before = dialogs;
+    StartProtection(hwnd);
+    CHECK(!g_app.active && !g_app.shutdownBlockApplied && dialogs == before + 1);
+    CHECK(shutdownCreates == shutdownDestroys);
+    missingShutdownCreate = FALSE;
+    missingShutdownDestroy = TRUE;
+    before = dialogs;
+    StartProtection(hwnd);
+    CHECK(!g_app.active && !g_app.shutdownBlockApplied && dialogs == before + 1);
+    CHECK(shutdownCreates == shutdownDestroys);
+    CHECK(!AppDestroyShutdownBlock(hwnd));
+    CHECK(GetLastError() == ERROR_CALL_NOT_IMPLEMENTED);
+    missingShutdownDestroy = FALSE;
     failShutdownCreate = TRUE;
     before = dialogs;
     StartProtection(hwnd);
