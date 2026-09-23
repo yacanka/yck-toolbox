@@ -12,7 +12,12 @@
  *   x86_64-w64-mingw32-windres -DAWAKEN_RESOURCES -J rc -O coff -i awaken.c -o awaken.res
  *   x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror -mwindows -static awaken.c awaken.res -o awaken.exe -lcomctl32 -ladvapi32 -lshell32 -lgdi32 -luser32 -Wl,--dynamicbase,--nxcompat
  * Use i686-w64-mingw32-* for x86. Only awaken.exe is needed at runtime.
+ * Dev-C++: compile this file as C (no AWAKEN_* test/resource defines).
+ * Linker options: -mwindows -static -lcomctl32 -ladvapi32 -lshell32 -lgdi32 -luser32
  * Resource and object files are build outputs, not additional source files.
+ * Building only awaken.c also works with classic controls; include resources
+ * for the version metadata and themed controls. Standard-control initialization
+ * falls back when the v6 activation context is unavailable.
  *
  * Portable regression tests (macOS/Linux/Windows):
  *   cc -std=c11 -Wall -Wextra -Werror -DAWAKEN_LOGIC_TEST awaken.c -o awaken_logic_tests
@@ -208,12 +213,15 @@ int main(void) {
 #include <stdio.h>
 #include <stdlib.h>
 static BOOL failTimer, failExecution, failPower, failPowerCreate;
+static BOOL failStandardControls, failAllControls;
+static unsigned int controlInitCalls;
 static unsigned int dialogs, requests, clears, executionCalls;
 static EXECUTION_STATE lastExecution;
 static int WINAPI TestMessageBoxW(HWND hwnd, LPCWSTR text, LPCWSTR title, UINT type);
 static UINT_PTR WINAPI TestSetTimer(HWND hwnd, UINT_PTR id, UINT timeout, TIMERPROC callback);
 static EXECUTION_STATE WINAPI TestExecutionState(EXECUTION_STATE flags);
 static FARPROC WINAPI TestGetProcAddress(HMODULE module, LPCSTR name);
+static BOOL WINAPI TestInitCommonControlsEx(const INITCOMMONCONTROLSEX *controls);
 
 #define REGISTRY_SETTINGS_PATH L"Software\\AwakenRegressionTests\\Settings"
 #define REGISTRY_RUN_PATH L"Software\\AwakenRegressionTests\\Run"
@@ -221,6 +229,7 @@ static FARPROC WINAPI TestGetProcAddress(HMODULE module, LPCSTR name);
 #define SetTimer TestSetTimer
 #define SetThreadExecutionState TestExecutionState
 #define GetProcAddress TestGetProcAddress
+#define InitCommonControlsEx TestInitCommonControlsEx
 #endif
 
 #define APP_CLASS_NAME             L"AwakenWindowClass"
@@ -668,13 +677,13 @@ static void UpdateStatusText(void) {
     WCHAR remaining[128];
 
     if (!g_app.active) {
-        SetWindowTextW(g_app.statusText, L"Inactive — Windows power settings are in effect");
+        SetWindowTextW(g_app.statusText, L"Inactive - Windows power settings are in effect");
         SetWindowTextW(g_app.remainingText, L"Protection is not active");
         InvalidateRect(g_app.statusText, NULL, TRUE);
         return;
     }
 
-    SetWindowTextW(g_app.statusText, L"Active — Selected protection is running");
+    SetWindowTextW(g_app.statusText, L"Active - Selected protection is running");
 
     if (g_app.endsAt == 0) {
         SetWindowTextW(g_app.remainingText, L"Duration: Unlimited");
@@ -896,7 +905,7 @@ static void CreateInterface(HWND hwnd) {
         hwnd, ID_COMBO_DURATION, g_app.fontNormal
     );
 
-    ComboBox_AddString(g_app.comboDuration, L"Unlimited — until stopped");
+    ComboBox_AddString(g_app.comboDuration, L"Unlimited - until stopped");
     ComboBox_AddString(g_app.comboDuration, L"15 minutes");
     ComboBox_AddString(g_app.comboDuration, L"30 minutes");
     ComboBox_AddString(g_app.comboDuration, L"1 hour");
@@ -1040,7 +1049,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             if (wParam == ID_TIMER_MAIN && g_app.active) {
                 if (g_app.endsAt != 0 && GetTickCount64() >= g_app.endsAt) {
                     if (StopProtection(hwnd)) {
-                        SetWindowTextW(g_app.remainingText, L"Duration ended — normal power settings restored");
+                        SetWindowTextW(g_app.remainingText, L"Duration ended - normal power settings restored");
                     }
                 } else {
                     UpdateStatusText();
@@ -1054,7 +1063,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
              * Stop the session instead of reporting stale protection on resume. */
             if (wParam == PBT_APMSUSPEND && g_app.active) {
                 if (StopProtection(hwnd)) {
-                    SetWindowTextW(g_app.remainingText, L"Stopped for system sleep — activate to start again");
+                    SetWindowTextW(g_app.remainingText, L"Stopped for system sleep - activate to start again");
                 }
             }
             return TRUE;
@@ -1123,6 +1132,31 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
+/* ICC_STANDARD_CLASSES may be unavailable without the v6 manifest. The
+ * standard buttons, labels and combo box can still use the classic controls. */
+static BOOL InitializeInterfaceControls(void) {
+    INITCOMMONCONTROLSEX controls;
+    controls.dwSize = sizeof(controls);
+    controls.dwICC = ICC_STANDARD_CLASSES;
+    if (InitCommonControlsEx(&controls)) return TRUE;
+    controls.dwICC = ICC_WIN95_CLASSES;
+    return InitCommonControlsEx(&controls);
+}
+
+static void ShowStartupError(LPCWSTR operation, DWORD error) {
+    WCHAR message[768];
+    WCHAR detail[512] = L"";
+    if (error != ERROR_SUCCESS) {
+        FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL, error, 0, detail, ARRAYSIZE(detail), NULL);
+        StringCchPrintfW(message, ARRAYSIZE(message),
+            L"%s\nWindows error %lu: %s", operation, (unsigned long)error, detail);
+    } else {
+        StringCchCopyW(message, ARRAYSIZE(message), operation);
+    }
+    MessageBoxW(NULL, message, APP_TITLE, MB_OK | MB_ICONERROR);
+}
+
 /*
  * Some older MinGW-w64 windows.h versions map WinMain to wWinMain when
  * UNICODE is defined. The program still uses the Unicode Win32 API, but the
@@ -1136,7 +1170,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     WNDCLASSEXW windowClass;
     HWND hwnd;
     MSG message;
-    INITCOMMONCONTROLSEX commonControls;
     RECT windowRect = {0, 0, WINDOW_WIDTH, WINDOW_HEIGHT};
     BOOL activateOnLaunch;
     BOOL getMessageResult;
@@ -1150,14 +1183,17 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     (void)previousInstance;
     (void)commandLine;
     arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
-    if (arguments == NULL) return 1;
+    if (arguments == NULL) {
+        ShowStartupError(L"Awaken could not read its command line.", GetLastError());
+        return 1;
+    }
     activateOnLaunch = HasActivateArgument(argumentCount, arguments);
     LocalFree(arguments);
 
     /* One owner per interactive session prevents invisible competing requests. */
     instanceMutex = CreateMutexW(NULL, FALSE, L"Local\\Awaken.Instance");
     if (instanceMutex == NULL) {
-        MessageBoxW(NULL, L"Awaken could not initialize its instance lock.", APP_TITLE, MB_OK | MB_ICONERROR);
+        ShowStartupError(L"Awaken could not initialize its instance lock.", GetLastError());
         return 1;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -1165,6 +1201,12 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
         if (existing != NULL) {
             ShowWindow(existing, SW_RESTORE);
             SetForegroundWindow(existing);
+        } else {
+            ShowStartupError(L"Another Awaken instance is running, but its window is not ready. "
+                L"Wait a moment and try again. If it remains unavailable, close the existing "
+                L"Awaken process in Task Manager before reopening it.", ERROR_SUCCESS);
+            CloseHandle(instanceMutex);
+            return 1;
         }
         CloseHandle(instanceMutex);
         return 0;
@@ -1179,9 +1221,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     windowRect.right = Scale(WINDOW_WIDTH);
     windowRect.bottom = Scale(WINDOW_HEIGHT);
 
-    commonControls.dwSize = sizeof(commonControls);
-    commonControls.dwICC = ICC_STANDARD_CLASSES;
-    if (!InitCommonControlsEx(&commonControls)) {
+    SetLastError(ERROR_SUCCESS);
+    if (!InitializeInterfaceControls()) {
+        ShowStartupError(L"Awaken could not initialize the Windows interface controls.", GetLastError());
         CloseHandle(instanceMutex);
         return 1;
     }
@@ -1209,7 +1251,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     windowClass.hIconSm = smallIcon;
 
     if (!RegisterClassExW(&windowClass)) {
-        MessageBoxW(NULL, L"The application window class could not be registered.", APP_TITLE, MB_OK | MB_ICONERROR);
+        ShowStartupError(L"The application window class could not be registered.", GetLastError());
         CloseHandle(instanceMutex);
         return 1;
     }
@@ -1232,7 +1274,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     );
 
     if (hwnd == NULL) {
-        MessageBoxW(NULL, L"The application window could not be created.", APP_TITLE, MB_OK | MB_ICONERROR);
+        ShowStartupError(L"The application window could not be created.", GetLastError());
         CloseHandle(instanceMutex);
         return 1;
     }
@@ -1240,7 +1282,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)largeIcon);
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)smallIcon);
 
-    ShowWindow(hwnd, showCommand);
+    /* A launcher may request SW_HIDE; Awaken has no tray UI to recover it. */
+    ShowWindow(hwnd, showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
     UpdateWindow(hwnd);
 
     if (activateOnLaunch) {
@@ -1254,6 +1297,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
         }
     }
 
+    if (getMessageResult == -1) {
+        ShowStartupError(L"The Windows message loop failed.", GetLastError());
+    }
     if (IsWindow(hwnd)) DestroyWindow(hwnd);
     CloseHandle(instanceMutex);
     return getMessageResult == -1 ? 1 : (int)message.wParam;
@@ -1265,10 +1311,40 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
 #undef SetTimer
 #undef SetThreadExecutionState
 #undef GetProcAddress
+#undef InitCommonControlsEx
 
 #define CHECK(condition) do { if (!(condition)) { \
     fprintf(stderr, "Failed at line %d: %s\n", __LINE__, #condition); exit(1); \
 } } while (0)
+
+static BOOL WINAPI TestInitCommonControlsEx(const INITCOMMONCONTROLSEX *controls) {
+    ++controlInitCalls;
+    if (failAllControls || (failStandardControls && controls->dwICC == ICC_STANDARD_CLASSES)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    return InitCommonControlsEx(controls);
+}
+
+/* Exercise the real entry point and message loop, not just control creation. */
+static DWORD WINAPI CloseStartupWindow(LPVOID unused) {
+    unsigned int attempt;
+    (void)unused;
+    for (attempt = 0; attempt < 100; ++attempt) {
+        HWND window = FindWindowW(APP_CLASS_NAME, NULL);
+        if (window != NULL && IsWindowVisible(window)) {
+            PostMessageW(window, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        Sleep(50);
+    }
+    /* Avoid hanging the test forever when a regression creates a hidden window. */
+    {
+        HWND window = FindWindowW(APP_CLASS_NAME, NULL);
+        if (window != NULL) PostMessageW(window, WM_CLOSE, 0, 0);
+    }
+    return 1;
+}
 
 static int WINAPI TestMessageBoxW(HWND hwnd, LPCWSTR text, LPCWSTR title, UINT type) {
     (void)hwnd; (void)text; (void)title; (void)type;
@@ -1328,13 +1404,27 @@ static void SelectOptions(BOOL sleep, BOOL display, BOOL saver) {
 
 int main(void) {
     WNDCLASSW cls = {0};
-    INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_STANDARD_CLASSES};
+    HANDLE closer;
+    DWORD closeResult;
+    MSG pending;
     HWND hwnd;
     unsigned int before;
     WCHAR text[128];
     HKEY key;
     DWORD invalid = 99;
-    CHECK(InitCommonControlsEx(&controls));
+    CHECK(InitializeInterfaceControls());
+    failStandardControls = TRUE;
+    controlInitCalls = 0;
+    CHECK(InitializeInterfaceControls());
+    CHECK(controlInitCalls == 2);
+    failAllControls = TRUE;
+    CHECK(!InitializeInterfaceControls());
+    CHECK(controlInitCalls == 4);
+    before = dialogs;
+    CHECK(WinMain(GetModuleHandleW(NULL), NULL, NULL, SW_SHOWNORMAL) == 1);
+    CHECK(dialogs == before + 1);
+    failAllControls = FALSE;
+    failStandardControls = FALSE;
     g_app.dpi = 144;
     CHECK(Scale(100) == 150);
     cls.lpfnWndProc = WindowProc;
@@ -1433,6 +1523,18 @@ int main(void) {
     CHECK(g_app.active);
     DestroyWindow(hwnd);
     CHECK(requests == clears && lastExecution == ES_CONTINUOUS);
+    /* WM_DESTROY posted WM_QUIT; start the entry-point smoke test with a clean queue. */
+    while (PeekMessageW(&pending, NULL, 0, 0, PM_REMOVE)) { }
+    failStandardControls = TRUE;
+    closer = CreateThread(NULL, 0, CloseStartupWindow, NULL, 0, NULL);
+    CHECK(closer != NULL);
+    before = dialogs;
+    CHECK(WinMain(GetModuleHandleW(NULL), NULL, NULL, SW_HIDE) == 0);
+    CHECK(WaitForSingleObject(closer, 10000) == WAIT_OBJECT_0);
+    CHECK(GetExitCodeThread(closer, &closeResult) && closeResult == 0);
+    CHECK(dialogs == before);
+    CloseHandle(closer);
+    failStandardControls = FALSE;
     CHECK(RegDeleteKeyW(HKEY_CURRENT_USER, REGISTRY_SETTINGS_PATH) == ERROR_SUCCESS);
     CHECK(RegDeleteKeyW(HKEY_CURRENT_USER, REGISTRY_RUN_PATH) == ERROR_SUCCESS);
     CHECK(RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\AwakenRegressionTests") == ERROR_SUCCESS);
