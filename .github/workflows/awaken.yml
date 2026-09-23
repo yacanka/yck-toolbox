@@ -12,21 +12,34 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        architecture: [x64, Win32]
+        architecture: [x64, x86]
     steps:
       - uses: actions/checkout@v4
-      - run: cmake -S tools/awaken -B build -A ${{ matrix.architecture }}
-      - run: cmake --build build --config Release
-      - run: ctest --test-dir build -C Release --output-on-failure
-      - run: cmake --install build --config Release --prefix dist
+      - name: Build application and run embedded tests
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\Common7\Tools\VsDevCmd.bat" -arch=${{ matrix.architecture }}
+          if errorlevel 1 exit /b 1
+          mkdir build
+          rc /nologo /d AWAKEN_RESOURCES /fo build\awaken.res tools\awaken\awaken.c
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c11 /W4 /WX /utf-8 /MT tools\awaken\awaken.c build\awaken.res /Fo:build\awaken.obj /Fe:build\awaken.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:NO /DYNAMICBASE /NXCOMPAT
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c11 /W4 /WX /utf-8 /MT /DAWAKEN_LOGIC_TEST tools\awaken\awaken.c /Fo:build\logic.obj /Fe:build\awaken_logic_tests.exe
+          if errorlevel 1 exit /b 1
+          build\awaken_logic_tests.exe
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c11 /W4 /WX /utf-8 /MT /DAWAKEN_WINDOWS_TEST tools\awaken\awaken.c /Fo:build\windows.obj /Fe:build\awaken_windows_tests.exe
+          if errorlevel 1 exit /b 1
+          build\awaken_windows_tests.exe
+          if errorlevel 1 exit /b 1
       - uses: actions/upload-artifact@v4
         with:
           name: Awaken-${{ matrix.architecture }}
-          path: dist/
+          path: build/awaken.exe
   portable-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cmake -S tools/awaken -B build
-      - run: cmake --build build
-      - run: ctest --test-dir build --output-on-failure
+      - run: cc -std=c11 -Wall -Wextra -Werror -DAWAKEN_LOGIC_TEST tools/awaken/awaken.c -o awaken_logic_tests
+      - run: ./awaken_logic_tests

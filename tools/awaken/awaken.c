@@ -1,3 +1,185 @@
+/*
+ * Awaken 1.0.0 - single-file Windows desktop utility.
+ * This file contains the application, resources, tests and build instructions.
+ * No project files, resource headers, external manifests or libraries beyond
+ * the Windows SDK are required. Windows 10/11 are the deployment targets.
+ *
+ * MSVC (Visual Studio Developer Command Prompt, from this directory):
+ *   rc /nologo /d AWAKEN_RESOURCES /fo awaken.res awaken.c
+ *   cl /nologo /std:c11 /W4 /WX /utf-8 /MT awaken.c awaken.res /Fe:awaken.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:NO /DYNAMICBASE /NXCOMPAT
+ *
+ * MinGW-w64 (native or cross-build, from this directory):
+ *   x86_64-w64-mingw32-windres -DAWAKEN_RESOURCES -J rc -O coff -i awaken.c -o awaken.res
+ *   x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror -mwindows -static awaken.c awaken.res -o awaken.exe -lcomctl32 -ladvapi32 -lshell32 -lgdi32 -luser32 -Wl,--dynamicbase,--nxcompat
+ * Use i686-w64-mingw32-* for x86. Only awaken.exe is needed at runtime.
+ * Resource and object files are build outputs, not additional source files.
+ *
+ * Portable regression tests (macOS/Linux/Windows):
+ *   cc -std=c11 -Wall -Wextra -Werror -DAWAKEN_LOGIC_TEST awaken.c -o awaken_logic_tests
+ *   ./awaken_logic_tests
+ * Windows lifecycle tests (Developer Command Prompt):
+ *   cl /nologo /std:c11 /W4 /WX /utf-8 /MT /DAWAKEN_WINDOWS_TEST awaken.c /Fe:awaken_windows_tests.exe
+ *   awaken_windows_tests.exe
+ * For MSVC portable tests use /DAWAKEN_LOGIC_TEST in the same command.
+ * Tests use real controls with simulated power/timer failures and isolated keys
+ * under HKCU\Software\AwakenRegressionTests (removed on success).
+ * No test code or test Registry overrides are included in the normal executable.
+ *
+ * Usage: select protection, select a duration, then Activate. Stop, expiry or
+ * closing the window releases requests. Minimize keeps protection active.
+ * Tab/Shift+Tab navigate; Space toggles; Alt+A activates; Alt+T stops;
+ * Alt+D toggles display protection; Alt+U selects duration.
+ * Only a separate exact --activate argument auto-starts with saved options.
+ * A second launch shows the existing instance without restarting its timer.
+ *
+ * Prevent screen saver also keeps the display on. Select sleep protection too
+ * if the computer must stay awake. Manual sleep, locking, lid actions and policy
+ * remain effective. Suspend ends the session; activate again after resume.
+ * Windows may override power requests, especially on battery/Modern Standby.
+ * This application does not simulate input or alter global power settings.
+ * https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-powersetrequest
+ * https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate
+ *
+ * Settings: HKCU\Software\Awaken. Auto-start: the Awaken value in
+ * HKCU\Software\Microsoft\Windows\CurrentVersion\Run. No admin rights needed.
+ * Naming upgrade: settings from the previous product name are not migrated.
+ * Disable auto-start in the previous version before replacing it; re-enable
+ * from Awaken if desired. Disable auto-start before moving/removing the exe.
+ * Uninstall: disable auto-start, close, remove exe; optionally remove settings.
+ *
+ * Release checks: run both test modes on Windows; test 100/150/200% scaling,
+ * high contrast, keyboard navigation, each protection option and combinations,
+ * powercfg /requests before/during/after protection, expiry while minimized,
+ * manual sleep/resume, duplicate launch, startup from paths containing spaces,
+ * AC and battery/Modern Standby. The UI scales with system DPI at startup.
+ * Cross-compilation and simulated tests cannot validate physical power behavior.
+ * Binaries are unsigned; distribution signing requires your own certificate.
+ */
+
+#if defined(AWAKEN_RESOURCES)
+
+#include <windows.h>
+1 RT_MANIFEST
+BEGIN
+    "<?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?>"
+    "<assembly xmlns=""urn:schemas-microsoft-com:asm.v1"" manifestVersion=""1.0"">"
+    "  <assemblyIdentity version=""1.0.0.0"" processorArchitecture=""*"" name=""YcK.Awaken"" type=""win32""/>"
+    "  <description>Awaken desktop power protection</description>"
+    "  <dependency><dependentAssembly>"
+    "    <assemblyIdentity type=""win32"" name=""Microsoft.Windows.Common-Controls"" version=""6.0.0.0"" processorArchitecture=""*"" publicKeyToken=""6595b64144ccf1df"" language=""*""/>"
+    "  </dependentAssembly></dependency>"
+    "  <trustInfo xmlns=""urn:schemas-microsoft-com:asm.v3""><security><requestedPrivileges>"
+    "    <requestedExecutionLevel level=""asInvoker"" uiAccess=""false""/>"
+    "  </requestedPrivileges></security></trustInfo>"
+    "  <application xmlns=""urn:schemas-microsoft-com:asm.v3""><windowsSettings>"
+    "    <dpiAware xmlns=""http://schemas.microsoft.com/SMI/2005/WindowsSettings"">true</dpiAware>"
+    "  </windowsSettings></application>"
+    "  <compatibility xmlns=""urn:schemas-microsoft-com:compatibility.v1""><application>"
+    "    <supportedOS Id=""{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}""/>"
+    "  </application></compatibility>"
+    "</assembly>"
+END
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "FileDescription", "Awaken\0"
+      VALUE "FileVersion", "1.0.0\0"
+      VALUE "ProductName", "Awaken\0"
+      VALUE "ProductVersion", "1.0.0\0"
+      VALUE "OriginalFilename", "awaken.exe\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
+
+#else /* C compilation */
+
+#include <stdint.h>
+#include <wchar.h>
+
+/* argv[0] is a path, never an activation request. */
+static int HasActivateArgument(int count, wchar_t **arguments) {
+    int index;
+    for (index = 1; index < count; ++index) {
+        if (wcscmp(arguments[index], L"--activate") == 0) return 1;
+    }
+    return 0;
+}
+
+/* Index order is persisted in the registry; keep existing entries stable. */
+static int DurationMinutesFromSelection(int selection) {
+    switch (selection) {
+        case 1: return 15;
+        case 2: return 30;
+        case 3: return 60;
+        case 4: return 120;
+        case 5: return 240;
+        case 6: return 480;
+        default: return 0;
+    }
+}
+
+static uint64_t RemainingSeconds(uint64_t milliseconds) {
+    /* Round up without overflowing at UINT64_MAX. */
+    return milliseconds / 1000 + (milliseconds % 1000 != 0);
+}
+
+#if defined(AWAKEN_LOGIC_TEST)
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#define CHECK(condition) do { if (!(condition)) { \
+    fprintf(stderr, "Failed at line %d: %s\n", __LINE__, #condition); exit(1); \
+} } while (0)
+
+int main(void) {
+    int durations[] = {0, 15, 30, 60, 120, 240, 480};
+    wchar_t *pathOnly[] = {L"C:\\--activate\\awaken.exe"};
+    wchar_t *partial[] = {L"awaken.exe", L"--activate-later"};
+    wchar_t *embedded[] = {L"awaken.exe", L"prefix--activate"};
+    wchar_t *exact[] = {L"C:\\Program Files\\Awaken.exe", L"--activate"};
+    wchar_t *multiple[] = {L"awaken.exe", L"--unknown", L"--activate"};
+    int index;
+    for (index = 0; index < 7; ++index) CHECK(DurationMinutesFromSelection(index) == durations[index]);
+    CHECK(DurationMinutesFromSelection(-1) == 0);
+    CHECK(DurationMinutesFromSelection(7) == 0);
+    CHECK(!HasActivateArgument(0, NULL));
+    CHECK(!HasActivateArgument(1, pathOnly));
+    CHECK(!HasActivateArgument(2, partial));
+    CHECK(!HasActivateArgument(2, embedded));
+    CHECK(HasActivateArgument(2, exact));
+    CHECK(HasActivateArgument(3, multiple));
+    CHECK(RemainingSeconds(0) == 0);
+    CHECK(RemainingSeconds(1) == 1);
+    CHECK(RemainingSeconds(999) == 1);
+    CHECK(RemainingSeconds(1000) == 1);
+    CHECK(RemainingSeconds(1001) == 2);
+    CHECK(RemainingSeconds(28800000) == 28800);
+    CHECK(RemainingSeconds(UINT64_MAX) == UINT64_MAX / 1000 + 1);
+    puts("Awaken logic tests passed");
+    return 0;
+}
+
+#else /* Windows application or lifecycle tests */
+
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+
 #define UNICODE
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
@@ -10,7 +192,7 @@
 #include <wchar.h>
 #include <shellapi.h>
 #include <string.h>
-#include "awaken_logic.h"
+
 
 
 
@@ -18,17 +200,38 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
 #endif
 
-#define APP_CLASS_NAME             L"IAmAwakeWindowClass"
+#ifdef AWAKEN_WINDOWS_TEST
+#include <stdio.h>
+#include <stdlib.h>
+static BOOL failTimer, failExecution, failPower, failPowerCreate;
+static unsigned int dialogs, requests, clears, executionCalls;
+static EXECUTION_STATE lastExecution;
+static int WINAPI TestMessageBoxW(HWND hwnd, LPCWSTR text, LPCWSTR title, UINT type);
+static UINT_PTR WINAPI TestSetTimer(HWND hwnd, UINT_PTR id, UINT timeout, TIMERPROC callback);
+static EXECUTION_STATE WINAPI TestExecutionState(EXECUTION_STATE flags);
+static FARPROC WINAPI TestGetProcAddress(HMODULE module, LPCSTR name);
+
+#define REGISTRY_SETTINGS_PATH L"Software\\AwakenRegressionTests\\Settings"
+#define REGISTRY_RUN_PATH L"Software\\AwakenRegressionTests\\Run"
+#define MessageBoxW TestMessageBoxW
+#define SetTimer TestSetTimer
+#define SetThreadExecutionState TestExecutionState
+#define GetProcAddress TestGetProcAddress
+#endif
+
+#define APP_CLASS_NAME             L"AwakenWindowClass"
 #define APP_TITLE                  L"Awaken"
 #ifndef REGISTRY_SETTINGS_PATH
-#define REGISTRY_SETTINGS_PATH     L"Software\\IAmAwake"
+#define REGISTRY_SETTINGS_PATH     L"Software\\Awaken"
 #endif
 #ifndef REGISTRY_RUN_PATH
 #define REGISTRY_RUN_PATH          L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #endif
-#define REGISTRY_RUN_VALUE         L"IAmAwake"
+#define REGISTRY_RUN_VALUE         L"Awaken"
 
 #define ID_CHECK_SYSTEM_SLEEP      1001
 #define ID_CHECK_DISPLAY_OFF       1002
@@ -952,7 +1155,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     LocalFree(arguments);
 
     /* One owner per interactive session prevents invisible competing requests. */
-    instanceMutex = CreateMutexW(NULL, FALSE, L"Local\\IAmAwake.Instance");
+    instanceMutex = CreateMutexW(NULL, FALSE, L"Local\\Awaken.Instance");
     if (instanceMutex == NULL) {
         MessageBoxW(NULL, L"Awaken could not initialize its instance lock.", APP_TITLE, MB_OK | MB_ICONERROR);
         return 1;
@@ -1055,3 +1258,188 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     CloseHandle(instanceMutex);
     return getMessageResult == -1 ? 1 : (int)message.wParam;
 }
+
+#ifdef AWAKEN_WINDOWS_TEST
+
+#undef MessageBoxW
+#undef SetTimer
+#undef SetThreadExecutionState
+#undef GetProcAddress
+
+#define CHECK(condition) do { if (!(condition)) { \
+    fprintf(stderr, "Failed at line %d: %s\n", __LINE__, #condition); exit(1); \
+} } while (0)
+
+static int WINAPI TestMessageBoxW(HWND hwnd, LPCWSTR text, LPCWSTR title, UINT type) {
+    (void)hwnd; (void)text; (void)title; (void)type;
+    ++dialogs;
+    return IDOK;
+}
+static UINT_PTR WINAPI TestSetTimer(HWND hwnd, UINT_PTR id, UINT timeout, TIMERPROC callback) {
+    (void)hwnd; (void)timeout; (void)callback;
+    return failTimer ? 0 : id;
+}
+static EXECUTION_STATE WINAPI TestExecutionState(EXECUTION_STATE flags) {
+    ++executionCalls;
+    lastExecution = flags;
+    return failExecution ? 0 : ES_CONTINUOUS;
+}
+static HANDLE WINAPI TestPowerCreate(AppPowerReasonContext *context) {
+    CHECK(context->Version == 0);
+    if (failPowerCreate) return INVALID_HANDLE_VALUE;
+    return CreateEventW(NULL, TRUE, FALSE, NULL);
+}
+static BOOL WINAPI TestPowerSet(HANDLE handle, int type) {
+    CHECK(handle != NULL && type == 0);
+    if (failPower) return FALSE;
+    ++requests;
+    return TRUE;
+}
+static BOOL WINAPI TestPowerClear(HANDLE handle, int type) {
+    CHECK(handle != NULL && type == 0);
+    ++clears;
+    return TRUE;
+}
+static FARPROC WINAPI TestGetProcAddress(HMODULE module, LPCSTR name) {
+    FARPROC address;
+    if (strcmp(name, "PowerCreateRequest") == 0) {
+        AppPowerCreateRequestFunction function = TestPowerCreate;
+        memcpy(&address, &function, sizeof(address));
+        return address;
+    }
+    if (strcmp(name, "PowerSetRequest") == 0) {
+        AppPowerSetRequestFunction function = TestPowerSet;
+        memcpy(&address, &function, sizeof(address));
+        return address;
+    }
+    if (strcmp(name, "PowerClearRequest") == 0) {
+        AppPowerClearRequestFunction function = TestPowerClear;
+        memcpy(&address, &function, sizeof(address));
+        return address;
+    }
+    return GetProcAddress(module, name);
+}
+
+static void SelectOptions(BOOL sleep, BOOL display, BOOL saver) {
+    Button_SetCheck(g_app.checkSystemSleep, sleep ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(g_app.checkDisplayOff, display ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(g_app.checkScreensaver, saver ? BST_CHECKED : BST_UNCHECKED);
+}
+
+int main(void) {
+    WNDCLASSW cls = {0};
+    INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_STANDARD_CLASSES};
+    HWND hwnd;
+    unsigned int before;
+    WCHAR text[128];
+    HKEY key;
+    DWORD invalid = 99;
+    CHECK(InitCommonControlsEx(&controls));
+    g_app.dpi = 144;
+    CHECK(Scale(100) == 150);
+    cls.lpfnWndProc = WindowProc;
+    cls.hInstance = GetModuleHandleW(NULL);
+    cls.lpszClassName = L"AwakenTestWindow";
+    CHECK(RegisterClassW(&cls));
+    hwnd = CreateWindowW(cls.lpszClassName, L"Test", WS_OVERLAPPEDWINDOW,
+        0, 0, 1000, 1000, NULL, NULL, cls.hInstance, NULL);
+    CHECK(hwnd != NULL && !g_app.interfaceFailed);
+    CHECK(SetStartupEnabled(FALSE));
+    CHECK(!IsStartupEnabled());
+    CHECK(SetStartupEnabled(TRUE));
+    CHECK(IsStartupEnabled());
+    CHECK(SetStartupEnabled(FALSE));
+    CHECK(!IsStartupEnabled());
+
+    SelectOptions(FALSE, FALSE, FALSE);
+    before = dialogs;
+    StartProtection(hwnd);
+    CHECK(!g_app.active && dialogs == before + 1);
+    SelectOptions(TRUE, TRUE, TRUE);
+    failPowerCreate = TRUE;
+    StartProtection(hwnd);
+    CHECK(!g_app.active && g_app.displayPowerRequestHandle == NULL);
+    failPowerCreate = FALSE;
+    failPower = TRUE;
+    StartProtection(hwnd);
+    CHECK(!g_app.active && !g_app.executionStateApplied);
+    CHECK(g_app.displayPowerRequestHandle == NULL);
+    failPower = FALSE;
+    failExecution = TRUE;
+    StartProtection(hwnd);
+    CHECK(!g_app.active && requests == clears);
+    failExecution = FALSE;
+    failTimer = TRUE;
+    StartProtection(hwnd);
+    CHECK(!g_app.active && !g_app.executionStateApplied);
+    CHECK(lastExecution == ES_CONTINUOUS && requests == clears);
+    failTimer = FALSE;
+
+    ComboBox_SetCurSel(g_app.comboDuration, 1);
+    StartProtection(hwnd);
+    CHECK(g_app.active && g_app.endsAt - g_app.startedAt == 900000);
+    CHECK(lastExecution == (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED));
+    CHECK(!IsWindowEnabled(g_app.buttonStart) && IsWindowEnabled(g_app.buttonStop));
+    before = requests;
+    StartProtection(hwnd);
+    CHECK(requests == before);
+    failExecution = TRUE;
+    CHECK(!StopProtection(hwnd));
+    CHECK(g_app.active && g_app.executionStateApplied);
+    CHECK(IsWindowEnabled(g_app.buttonStop));
+    failExecution = FALSE;
+    CHECK(StopProtection(hwnd));
+    StartProtection(hwnd);
+    before = dialogs;
+    g_app.endsAt = GetTickCount64();
+    SendMessageW(hwnd, WM_TIMER, ID_TIMER_MAIN, 0);
+    CHECK(!g_app.active && requests == clears && dialogs == before);
+    CHECK(IsWindowEnabled(g_app.buttonStart) && !IsWindowEnabled(g_app.buttonStop));
+
+    SelectOptions(FALSE, FALSE, TRUE);
+    ComboBox_SetCurSel(g_app.comboDuration, 0);
+    before = executionCalls;
+    StartProtection(hwnd);
+    CHECK(g_app.active && g_app.endsAt == 0 && executionCalls == before);
+    StopProtection(hwnd);
+    CHECK(requests == clears);
+    StopProtection(hwnd);
+    CHECK(requests == clears);
+    FormatRemainingTime(3600001, text, ARRAYSIZE(text));
+    CHECK(wcscmp(text, L"Remaining time: 01:00:01") == 0);
+
+    SelectOptions(TRUE, FALSE, FALSE);
+    ComboBox_SetCurSel(g_app.comboDuration, 6);
+    SaveSettings();
+    SelectOptions(FALSE, TRUE, TRUE);
+    ComboBox_SetCurSel(g_app.comboDuration, 0);
+    LoadSettings();
+    CHECK(Button_GetCheck(g_app.checkSystemSleep) == BST_CHECKED);
+    CHECK(Button_GetCheck(g_app.checkDisplayOff) == BST_UNCHECKED);
+    CHECK(Button_GetCheck(g_app.checkScreensaver) == BST_UNCHECKED);
+    CHECK(ComboBox_GetCurSel(g_app.comboDuration) == 6);
+    CHECK(RegOpenKeyExW(HKEY_CURRENT_USER, REGISTRY_SETTINGS_PATH, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS);
+    CHECK(WriteRegistryDword(key, L"DurationIndex", invalid));
+    RegCloseKey(key);
+    LoadSettings();
+    CHECK(ComboBox_GetCurSel(g_app.comboDuration) == 0);
+
+    SelectOptions(TRUE, TRUE, TRUE);
+    StartProtection(hwnd);
+    CHECK(g_app.active);
+    SendMessageW(hwnd, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
+    CHECK(!g_app.active && requests == clears);
+    StartProtection(hwnd);
+    CHECK(g_app.active);
+    DestroyWindow(hwnd);
+    CHECK(requests == clears && lastExecution == ES_CONTINUOUS);
+    CHECK(RegDeleteKeyW(HKEY_CURRENT_USER, REGISTRY_SETTINGS_PATH) == ERROR_SUCCESS);
+    CHECK(RegDeleteKeyW(HKEY_CURRENT_USER, REGISTRY_RUN_PATH) == ERROR_SUCCESS);
+    CHECK(RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\AwakenRegressionTests") == ERROR_SUCCESS);
+    puts("Awaken Windows lifecycle tests passed");
+    return 0;
+}
+
+#endif /* AWAKEN_WINDOWS_TEST */
+#endif /* AWAKEN_LOGIC_TEST */
+#endif /* AWAKEN_RESOURCES */
