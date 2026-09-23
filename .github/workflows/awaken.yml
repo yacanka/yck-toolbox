@@ -1,0 +1,32 @@
+name: Awaken
+on:
+  push:
+    paths: ['tools/awaken/**', '.github/workflows/awaken.yml']
+  pull_request:
+    paths: ['tools/awaken/**', '.github/workflows/awaken.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        architecture: [x64, Win32]
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S tools/awaken -B build -A ${{ matrix.architecture }}
+      - run: cmake --build build --config Release
+      - run: ctest --test-dir build -C Release --output-on-failure
+      - run: cmake --install build --config Release --prefix dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Awaken-${{ matrix.architecture }}
+          path: dist/
+  portable-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S tools/awaken -B build
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure

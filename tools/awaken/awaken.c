@@ -8,21 +8,26 @@
 #include <strsafe.h>
 #include <stdint.h>
 #include <wchar.h>
+#include <shellapi.h>
+#include <string.h>
+#include "awaken_logic.h"
 
-#include "resource.h"
+
 
 #ifdef _MSC_VER
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(linker, \
-    "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' " \
-    "version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+#pragma comment(lib, "shell32.lib")
 #endif
 
 #define APP_CLASS_NAME             L"IAmAwakeWindowClass"
-#define APP_TITLE                  L"I am awake"
+#define APP_TITLE                  L"Awaken"
+#ifndef REGISTRY_SETTINGS_PATH
 #define REGISTRY_SETTINGS_PATH     L"Software\\IAmAwake"
+#endif
+#ifndef REGISTRY_RUN_PATH
 #define REGISTRY_RUN_PATH          L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#endif
 #define REGISTRY_RUN_VALUE         L"IAmAwake"
 
 #define ID_CHECK_SYSTEM_SLEEP      1001
@@ -37,7 +42,7 @@
 #define ID_TIMER_MAIN              2001
 
 #define WINDOW_WIDTH               620
-#define WINDOW_HEIGHT              570
+#define WINDOW_HEIGHT              600
 
 static const COLORREF APP_COLOR_BACKGROUND = RGB(246, 248, 251);
 static const COLORREF COLOR_TEXT = RGB(31, 41, 55);
@@ -67,7 +72,8 @@ typedef struct AppState {
     BOOL executionStateApplied;
     HANDLE displayPowerRequestHandle;
     BOOL displayPowerRequestApplied;
-    BOOL displayPowerRequestFailed;
+    int dpi;
+    BOOL interfaceFailed;
 
     ULONGLONG startedAt;
     ULONGLONG endsAt;
@@ -104,27 +110,25 @@ typedef BOOL (WINAPI *AppPowerClearRequestFunction)(HANDLE requestHandle, int re
 static const int PowerRequestDisplayRequiredValue = 0;
 
 static HICON LoadApplicationIcon(HINSTANCE instance, int width, int height) {
-    HICON icon = (HICON)LoadImageW(
-        instance,
-        MAKEINTRESOURCEW(IDI_APP_ICON),
-        IMAGE_ICON,
-        width,
-        height,
-        LR_DEFAULTCOLOR | LR_SHARED
-    );
-
-    if (icon == NULL) {
-        icon = LoadIconW(NULL, IDI_APPLICATION);
-    }
+    /* Use a shared system icon; no missing external icon resource is required. */
+    HICON icon = LoadIconW(NULL, IDI_APPLICATION);
+    (void)instance;
+    (void)width;
+    (void)height;
 
     return icon;
 }
 
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 static void StartProtection(HWND hwnd);
-static void StopProtection(HWND hwnd);
+static BOOL StopProtection(HWND hwnd);
 static void UpdateStatusText(void);
 static void SaveSettings(void);
+
+static int Scale(int value) {
+    return MulDiv(value, g_app.dpi, 96);
+}
+
 
 /*
  * Older MinGW-w64 SDK/import-library versions may declare SetProcessDPIAware
@@ -143,7 +147,7 @@ static void EnableDpiAwarenessIfSupported(void) {
     procedureAddress = GetProcAddress(user32Module, "SetProcessDPIAware");
     if (procedureAddress != NULL) {
         SetProcessDPIAwareFunction setProcessDPIAwareFunction;
-        setProcessDPIAwareFunction = (SetProcessDPIAwareFunction)procedureAddress;
+        memcpy(&setProcessDPIAwareFunction, &procedureAddress, sizeof(setProcessDPIAwareFunction));
         (void)setProcessDPIAwareFunction();
     }
 }
@@ -154,6 +158,7 @@ static BOOL ApplyPowerRequestDisplayRequired(void) {
     AppPowerSetRequestFunction powerSetRequest;
     AppPowerReasonContext reasonContext;
     HANDLE requestHandle;
+    FARPROC address;
 
     if (g_app.displayPowerRequestApplied) {
         return TRUE;
@@ -164,10 +169,10 @@ static BOOL ApplyPowerRequestDisplayRequired(void) {
         return FALSE;
     }
 
-    powerCreateRequest = (AppPowerCreateRequestFunction)(void *)
-        GetProcAddress(kernel32Module, "PowerCreateRequest");
-    powerSetRequest = (AppPowerSetRequestFunction)(void *)
-        GetProcAddress(kernel32Module, "PowerSetRequest");
+    address = GetProcAddress(kernel32Module, "PowerCreateRequest");
+    memcpy(&powerCreateRequest, &address, sizeof(powerCreateRequest));
+    address = GetProcAddress(kernel32Module, "PowerSetRequest");
+    memcpy(&powerSetRequest, &address, sizeof(powerSetRequest));
 
     if (powerCreateRequest == NULL || powerSetRequest == NULL) {
         return FALSE;
@@ -177,7 +182,7 @@ static BOOL ApplyPowerRequestDisplayRequired(void) {
     reasonContext.Version = APP_POWER_REQUEST_CONTEXT_VERSION;
     reasonContext.Flags = APP_POWER_REQUEST_CONTEXT_SIMPLE_STRING;
     reasonContext.Reason.SimpleReasonString =
-        L"I am awake is preventing the screen saver and automatic display timeout.";
+        L"Awaken is preventing the screen saver and automatic display timeout.";
 
     requestHandle = powerCreateRequest(&reasonContext);
     if (requestHandle == NULL || requestHandle == INVALID_HANDLE_VALUE) {
@@ -198,6 +203,7 @@ static BOOL ApplyPowerRequestDisplayRequired(void) {
 static void ClearPowerRequestDisplayRequired(void) {
     HMODULE kernel32Module;
     AppPowerClearRequestFunction powerClearRequest;
+    FARPROC address;
 
     if (g_app.displayPowerRequestHandle == NULL) {
         g_app.displayPowerRequestApplied = FALSE;
@@ -206,8 +212,8 @@ static void ClearPowerRequestDisplayRequired(void) {
 
     kernel32Module = GetModuleHandleW(L"kernel32.dll");
     if (kernel32Module != NULL) {
-        powerClearRequest = (AppPowerClearRequestFunction)(void *)
-            GetProcAddress(kernel32Module, "PowerClearRequest");
+        address = GetProcAddress(kernel32Module, "PowerClearRequest");
+        memcpy(&powerClearRequest, &address, sizeof(powerClearRequest));
 
         if (powerClearRequest != NULL && g_app.displayPowerRequestApplied) {
             (void)powerClearRequest(
@@ -240,15 +246,17 @@ static HWND CreateControl(
         className,
         text,
         style,
-        x,
-        y,
-        width,
-        height,
+        Scale(x),
+        Scale(y),
+        Scale(width),
+        Scale(height),
         parent,
         (HMENU)(INT_PTR)controlId,
         GetModuleHandleW(NULL),
         NULL
     );
+
+    if (control == NULL) g_app.interfaceFailed = TRUE;
 
     if (control != NULL && font != NULL) {
         SendMessageW(control, WM_SETFONT, (WPARAM)font, TRUE);
@@ -278,25 +286,34 @@ static BOOL ReadRegistryDword(LPCWSTR valueName, DWORD *value) {
     return result == ERROR_SUCCESS && type == REG_DWORD && size == sizeof(*value);
 }
 
-static void WriteRegistryDword(HKEY key, LPCWSTR valueName, DWORD value) {
-    RegSetValueExW(key, valueName, 0, REG_DWORD, (const BYTE *)&value, sizeof(value));
+static BOOL WriteRegistryDword(HKEY key, LPCWSTR valueName, DWORD value) {
+    return RegSetValueExW(key, valueName, 0, REG_DWORD,
+        (const BYTE *)&value, sizeof(value)) == ERROR_SUCCESS;
+}
+
+static BOOL BuildStartupCommand(WCHAR *command, size_t count) {
+    WCHAR path[MAX_PATH];
+    DWORD length = GetModuleFileNameW(NULL, path, ARRAYSIZE(path));
+    return length > 0 && length < ARRAYSIZE(path) &&
+        SUCCEEDED(StringCchPrintfW(command, count, L"\"%s\" --activate", path));
 }
 
 static BOOL IsStartupEnabled(void) {
     HKEY key = NULL;
-    LONG result;
+    WCHAR actual[MAX_PATH + 32] = {0};
+    WCHAR expected[MAX_PATH + 32];
     DWORD type = 0;
-    DWORD size = 0;
+    DWORD size = sizeof(actual);
+    LONG result;
 
+    if (!BuildStartupCommand(expected, ARRAYSIZE(expected))) return FALSE;
     result = RegOpenKeyExW(HKEY_CURRENT_USER, REGISTRY_RUN_PATH, 0, KEY_QUERY_VALUE, &key);
-    if (result != ERROR_SUCCESS) {
-        return FALSE;
-    }
-
-    result = RegQueryValueExW(key, REGISTRY_RUN_VALUE, NULL, &type, NULL, &size);
+    if (result != ERROR_SUCCESS) return FALSE;
+    result = RegQueryValueExW(key, REGISTRY_RUN_VALUE, NULL, &type, (LPBYTE)actual, &size);
     RegCloseKey(key);
-
-    return result == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ) && size > sizeof(WCHAR);
+    return result == ERROR_SUCCESS && type == REG_SZ &&
+        size >= sizeof(WCHAR) && size <= sizeof(actual) && size % sizeof(WCHAR) == 0 &&
+        actual[size / sizeof(WCHAR) - 1] == L'\0' && wcscmp(actual, expected) == 0;
 }
 
 static BOOL SetStartupEnabled(BOOL enabled) {
@@ -320,16 +337,8 @@ static BOOL SetStartupEnabled(BOOL enabled) {
     }
 
     if (enabled) {
-        WCHAR executablePath[MAX_PATH];
-        WCHAR commandLine[(MAX_PATH * 2) + 8];
-        DWORD pathLength = GetModuleFileNameW(NULL, executablePath, MAX_PATH);
-
-        if (pathLength == 0 || pathLength >= MAX_PATH) {
-            RegCloseKey(key);
-            return FALSE;
-        }
-
-        if (FAILED(StringCchPrintfW(commandLine, ARRAYSIZE(commandLine), L"\"%s\" --activate", executablePath))) {
+        WCHAR commandLine[MAX_PATH + 32];
+        if (!BuildStartupCommand(commandLine, ARRAYSIZE(commandLine))) {
             RegCloseKey(key);
             return FALSE;
         }
@@ -380,6 +389,7 @@ static void LoadSettings(void) {
 
 static void SaveSettings(void) {
     HKEY key = NULL;
+    BOOL saved = TRUE;
     LONG result = RegCreateKeyExW(
         HKEY_CURRENT_USER,
         REGISTRY_SETTINGS_PATH,
@@ -393,42 +403,36 @@ static void SaveSettings(void) {
     );
 
     if (result != ERROR_SUCCESS) {
+        MessageBoxW(g_app.hwnd, L"Settings could not be saved. Changes apply only to this session.",
+            APP_TITLE, MB_OK | MB_ICONWARNING);
         return;
     }
 
-    WriteRegistryDword(
+    saved = WriteRegistryDword(
         key,
         L"PreventSystemSleep",
         Button_GetCheck(g_app.checkSystemSleep) == BST_CHECKED
-    );
-    WriteRegistryDword(
+    ) && saved;
+    saved = WriteRegistryDword(
         key,
         L"PreventDisplayOff",
         Button_GetCheck(g_app.checkDisplayOff) == BST_CHECKED
-    );
-    WriteRegistryDword(
+    ) && saved;
+    saved = WriteRegistryDword(
         key,
         L"PreventScreensaver",
         Button_GetCheck(g_app.checkScreensaver) == BST_CHECKED
-    );
-    WriteRegistryDword(
+    ) && saved;
+    saved = WriteRegistryDword(
         key,
         L"DurationIndex",
         (DWORD)ComboBox_GetCurSel(g_app.comboDuration)
-    );
+    ) && saved;
 
     RegCloseKey(key);
-}
-
-static int DurationMinutesFromSelection(int selection) {
-    switch (selection) {
-        case 1: return 15;
-        case 2: return 30;
-        case 3: return 60;
-        case 4: return 120;
-        case 5: return 240;
-        case 6: return 480;
-        default: return 0;
+    if (!saved) {
+        MessageBoxW(g_app.hwnd, L"Some settings could not be saved. Check them next time you launch Awaken.",
+            APP_TITLE, MB_OK | MB_ICONWARNING);
     }
 }
 
@@ -442,7 +446,7 @@ static void SetConfigurationControlsEnabled(BOOL enabled) {
 }
 
 static void FormatRemainingTime(ULONGLONG milliseconds, WCHAR *buffer, size_t bufferCount) {
-    ULONGLONG totalSeconds = (milliseconds + 999ULL) / 1000ULL;
+    ULONGLONG totalSeconds = RemainingSeconds(milliseconds);
     ULONGLONG hours = totalSeconds / 3600ULL;
     ULONGLONG minutes = (totalSeconds % 3600ULL) / 60ULL;
     ULONGLONG seconds = totalSeconds % 60ULL;
@@ -461,20 +465,13 @@ static void UpdateStatusText(void) {
     WCHAR remaining[128];
 
     if (!g_app.active) {
-        SetWindowTextW(g_app.statusText, L"● Inactive — Windows power settings are in effect");
+        SetWindowTextW(g_app.statusText, L"Inactive — Windows power settings are in effect");
         SetWindowTextW(g_app.remainingText, L"Protection is not active");
         InvalidateRect(g_app.statusText, NULL, TRUE);
         return;
     }
 
-    if (g_app.displayPowerRequestFailed) {
-        SetWindowTextW(
-            g_app.statusText,
-            L"● Active — Sleep protection is running; PowerRequestDisplayRequired could not be applied"
-        );
-    } else {
-        SetWindowTextW(g_app.statusText, L"● Active — This computer is being kept awake");
-    }
+    SetWindowTextW(g_app.statusText, L"Active — Selected protection is running");
 
     if (g_app.endsAt == 0) {
         SetWindowTextW(g_app.remainingText, L"Duration: Unlimited");
@@ -510,18 +507,21 @@ static void StartProtection(HWND hwnd) {
     }
 
     g_app.executionStateApplied = FALSE;
-    g_app.displayPowerRequestFailed = FALSE;
 
     if (preventScreensaver) {
         if (!ApplyPowerRequestDisplayRequired()) {
-            g_app.displayPowerRequestFailed = TRUE;
+            MessageBoxW(hwnd,
+                L"Screen saver protection could not be applied. No protection was started. "
+                L"Try again or deselect the screen saver option.",
+                APP_TITLE, MB_OK | MB_ICONERROR);
+            return;
         }
     }
 
     if (preventSystemSleep) {
         executionFlags |= ES_SYSTEM_REQUIRED;
     }
-    if (preventDisplayOff || (preventScreensaver && g_app.displayPowerRequestFailed)) {
+    if (preventDisplayOff) {
         executionFlags |= ES_DISPLAY_REQUIRED;
     }
 
@@ -544,39 +544,53 @@ static void StartProtection(HWND hwnd) {
     g_app.endsAt = durationMinutes > 0
         ? g_app.startedAt + ((ULONGLONG)durationMinutes * 60ULL * 1000ULL)
         : 0;
+    if (SetTimer(hwnd, ID_TIMER_MAIN, 1000, NULL) == 0) {
+        if (!StopProtection(hwnd)) return;
+        MessageBoxW(hwnd, L"The protection timer could not be started. No protection is active.",
+            APP_TITLE, MB_OK | MB_ICONERROR);
+        return;
+    }
     g_app.active = TRUE;
 
     SetConfigurationControlsEnabled(FALSE);
-    SetTimer(hwnd, ID_TIMER_MAIN, 1000, NULL);
+    SetFocus(g_app.buttonStop);
     SaveSettings();
     UpdateStatusText();
 }
 
-static void StopProtection(HWND hwnd) {
-    (void)hwnd;
-
-    KillTimer(g_app.hwnd, ID_TIMER_MAIN);
+static BOOL StopProtection(HWND hwnd) {
+    BOOL wasActive = g_app.active;
+    KillTimer(hwnd, ID_TIMER_MAIN);
 
     if (g_app.executionStateApplied) {
-        SetThreadExecutionState(ES_CONTINUOUS);
+        if (SetThreadExecutionState(ES_CONTINUOUS) == 0) {
+            /* Keep the stop action available; do not claim a failed release worked.
+             * The timer is stopped to avoid repeated error dialogs on expiry. */
+            g_app.active = TRUE;
+            SetConfigurationControlsEnabled(FALSE);
+            SetWindowTextW(g_app.statusText, L"Protection could not be stopped");
+            SetWindowTextW(g_app.remainingText, L"Try Stop again, or close Awaken to release protection");
+            MessageBoxW(hwnd, L"Windows could not release protection. Try Stop again or close Awaken.",
+                APP_TITLE, MB_OK | MB_ICONERROR);
+            return FALSE;
+        }
         g_app.executionStateApplied = FALSE;
     }
 
     ClearPowerRequestDisplayRequired();
-    g_app.displayPowerRequestFailed = FALSE;
 
     g_app.active = FALSE;
     g_app.startedAt = 0;
     g_app.endsAt = 0;
 
     SetConfigurationControlsEnabled(TRUE);
+    if (wasActive) SetFocus(g_app.buttonStart);
     UpdateStatusText();
+    return TRUE;
 }
 
 static void CreateFonts(void) {
-    HDC hdc = GetDC(NULL);
-    int dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
-    ReleaseDC(NULL, hdc);
+    int dpiY = g_app.dpi;
 
     g_app.fontNormal = CreateFontW(
         -MulDiv(10, dpiY, 72), 0, 0, 0, FW_NORMAL,
@@ -628,7 +642,7 @@ static void CreateInterface(HWND hwnd) {
 
     subtitle = CreateControl(
         0, L"STATIC",
-        L"Prevent sleep, display timeout, and screen saver activation while the computer is idle.",
+        L"Keep Windows awake for a task, then return to your normal power settings.",
         WS_CHILD | WS_VISIBLE,
         30, 66, 550, 42,
         hwnd, 0, g_app.fontNormal
@@ -644,28 +658,28 @@ static void CreateInterface(HWND hwnd) {
     (void)groupProtection;
 
     g_app.checkSystemSleep = CreateControl(
-        0, L"BUTTON", L"Prevent the computer from going to sleep automatically",
+        0, L"BUTTON", L"Prevent automatic &sleep",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
         48, 145, 500, 28,
         hwnd, ID_CHECK_SYSTEM_SLEEP, g_app.fontNormal
     );
 
     g_app.checkDisplayOff = CreateControl(
-        0, L"BUTTON", L"Prevent the display from turning off or dimming automatically",
+        0, L"BUTTON", L"Keep the &display on",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
         48, 183, 500, 28,
         hwnd, ID_CHECK_DISPLAY_OFF, g_app.fontNormal
     );
 
     g_app.checkScreensaver = CreateControl(
-        0, L"BUTTON", L"Prevent the screen saver from starting automatically",
+        0, L"BUTTON", L"Prevent screen sa&ver (also keeps the display on)",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
         48, 221, 500, 28,
         hwnd, ID_CHECK_SCREENSAVER, g_app.fontNormal
     );
 
     durationLabel = CreateControl(
-        0, L"STATIC", L"Protection duration:",
+        0, L"STATIC", L"D&uration:",
         WS_CHILD | WS_VISIBLE,
         48, 258, 120, 24,
         hwnd, 0, g_app.fontNormal
@@ -696,7 +710,7 @@ static void CreateInterface(HWND hwnd) {
     (void)groupBehavior;
 
     g_app.checkStartup = CreateControl(
-        0, L"BUTTON", L"Start I am awake with Windows and activate protection",
+        0, L"BUTTON", L"Start Awaken with &Windows and activate protection",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
         48, 330, 500, 28,
         hwnd, ID_CHECK_STARTUP, g_app.fontNormal
@@ -717,14 +731,14 @@ static void CreateInterface(HWND hwnd) {
     );
 
     g_app.buttonStart = CreateControl(
-        0, L"BUTTON", L"Activate",
+        0, L"BUTTON", L"&Activate",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
         30, 462, 266, 42,
         hwnd, ID_BUTTON_START, g_app.fontButton
     );
 
     g_app.buttonStop = CreateControl(
-        0, L"BUTTON", L"Stop",
+        0, L"BUTTON", L"S&top",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         312, 462, 266, 42,
         hwnd, ID_BUTTON_STOP, g_app.fontButton
@@ -732,9 +746,9 @@ static void CreateInterface(HWND hwnd) {
 
     note = CreateControl(
         0, L"STATIC",
-        L"Note: Manual sleep, shutdown, screen lock, and laptop lid actions are not blocked.",
+        L"Manual sleep, screen lock and lid actions still work. Display protection alone does not prevent sleep.",
         WS_CHILD | WS_VISIBLE,
-        30, 516, 555, 34,
+        30, 516, 555, 36,
         hwnd, 0, g_app.fontSmall
     );
     (void)note;
@@ -742,7 +756,7 @@ static void CreateInterface(HWND hwnd) {
     footer = CreateControl(
         0, L"STATIC", L"Settings are stored in your user account; administrator privileges are not required.",
         WS_CHILD | WS_VISIBLE,
-        30, 548, 555, 22,
+        30, 554, 555, 36,
         hwnd, 0, g_app.fontSmall
     );
     (void)footer;
@@ -772,6 +786,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             g_app.hwnd = hwnd;
             g_app.backgroundBrush = CreateSolidBrush(APP_COLOR_BACKGROUND);
             CreateInterface(hwnd);
+            if (g_app.interfaceFailed || !g_app.backgroundBrush || !g_app.fontNormal ||
+                !g_app.fontSmall || !g_app.fontTitle || !g_app.fontButton) return -1;
             return 0;
 
         case WM_COMMAND: {
@@ -820,19 +836,25 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         case WM_TIMER:
             if (wParam == ID_TIMER_MAIN && g_app.active) {
                 if (g_app.endsAt != 0 && GetTickCount64() >= g_app.endsAt) {
-                    StopProtection(hwnd);
-                    MessageBoxW(
-                        hwnd,
-                        L"The selected protection duration has ended.",
-                        APP_TITLE,
-                        MB_OK | MB_ICONINFORMATION
-                    );
+                    if (StopProtection(hwnd)) {
+                        SetWindowTextW(g_app.remainingText, L"Duration ended — normal power settings restored");
+                    }
                 } else {
                     UpdateStatusText();
                 }
                 return 0;
             }
             break;
+
+        case WM_POWERBROADCAST:
+            /* Windows can discard power requests during user-initiated sleep.
+             * Stop the session instead of reporting stale protection on resume. */
+            if (wParam == PBT_APMSUSPEND && g_app.active) {
+                if (StopProtection(hwnd)) {
+                    SetWindowTextW(g_app.remainingText, L"Stopped for system sleep — activate to start again");
+                }
+            }
+            return TRUE;
 
         case WM_SYSCOMMAND:
             if (g_app.active) {
@@ -917,17 +939,49 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     BOOL getMessageResult;
     HICON largeIcon;
     HICON smallIcon;
+    HANDLE instanceMutex;
+    WCHAR **arguments;
+    int argumentCount;
+    HDC screen;
 
     (void)previousInstance;
     (void)commandLine;
-    activateOnLaunch = wcsstr(GetCommandLineW(), L"--activate") != NULL;
+    arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+    if (arguments == NULL) return 1;
+    activateOnLaunch = HasActivateArgument(argumentCount, arguments);
+    LocalFree(arguments);
+
+    /* One owner per interactive session prevents invisible competing requests. */
+    instanceMutex = CreateMutexW(NULL, FALSE, L"Local\\IAmAwake.Instance");
+    if (instanceMutex == NULL) {
+        MessageBoxW(NULL, L"Awaken could not initialize its instance lock.", APP_TITLE, MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowW(APP_CLASS_NAME, NULL);
+        if (existing != NULL) {
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+        }
+        CloseHandle(instanceMutex);
+        return 0;
+    }
 
     ZeroMemory(&g_app, sizeof(g_app));
     EnableDpiAwarenessIfSupported();
+    screen = GetDC(NULL);
+    g_app.dpi = screen != NULL ? GetDeviceCaps(screen, LOGPIXELSY) : 96;
+    if (screen != NULL) ReleaseDC(NULL, screen);
+    if (g_app.dpi <= 0) g_app.dpi = 96;
+    windowRect.right = Scale(WINDOW_WIDTH);
+    windowRect.bottom = Scale(WINDOW_HEIGHT);
 
     commonControls.dwSize = sizeof(commonControls);
     commonControls.dwICC = ICC_STANDARD_CLASSES;
-    InitCommonControlsEx(&commonControls);
+    if (!InitCommonControlsEx(&commonControls)) {
+        CloseHandle(instanceMutex);
+        return 1;
+    }
 
     largeIcon = LoadApplicationIcon(
         instance,
@@ -953,6 +1007,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
 
     if (!RegisterClassExW(&windowClass)) {
         MessageBoxW(NULL, L"The application window class could not be registered.", APP_TITLE, MB_OK | MB_ICONERROR);
+        CloseHandle(instanceMutex);
         return 1;
     }
 
@@ -975,6 +1030,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
 
     if (hwnd == NULL) {
         MessageBoxW(NULL, L"The application window could not be created.", APP_TITLE, MB_OK | MB_ICONERROR);
+        CloseHandle(instanceMutex);
         return 1;
     }
 
@@ -989,9 +1045,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     }
 
     while ((getMessageResult = (BOOL)GetMessageW(&message, NULL, 0, 0)) > 0) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
+        if (!IsDialogMessageW(hwnd, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
     }
 
+    if (IsWindow(hwnd)) DestroyWindow(hwnd);
+    CloseHandle(instanceMutex);
     return getMessageResult == -1 ? 1 : (int)message.wParam;
 }
