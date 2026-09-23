@@ -37,7 +37,8 @@
  * Usage: select protection, select a duration, then Activate. Stop, expiry or
  * closing the window releases requests. Minimize keeps protection active.
  * Tab/Shift+Tab navigate; Space toggles; Alt+A activates; Alt+T stops;
- * Alt+D toggles display protection; Alt+U selects duration.
+ * Alt+D toggles display protection; Alt+R toggles shutdown protection;
+ * Alt+U selects duration.
  * Only a separate exact --activate argument auto-starts with saved options.
  * A second launch shows the existing instance without restarting its timer.
  *
@@ -48,6 +49,14 @@
  * This application does not simulate input or alter global power settings.
  * https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-powersetrequest
  * https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate
+ *
+ * Shutdown protection is opt-in and blocks normal shutdown, restart, sign-out
+ * and application-restart requests while active, including when minimized.
+ * Windows cannot distinguish shutdown from restart here. Forced termination,
+ * critical shutdown, "Shut down anyway", crashes and power loss can override it.
+ * No shutdown commands are polled or aborted; no privileges or policies change.
+ * Stop, expiry, suspend and exit release the block. A canceled shutdown keeps it.
+ * https://learn.microsoft.com/en-us/windows/win32/shutdown/wm-queryendsession
  *
  * Settings: HKCU\Software\Awaken. Auto-start: the Awaken value in
  * HKCU\Software\Microsoft\Windows\CurrentVersion\Run. No admin rights needed.
@@ -61,6 +70,13 @@
  * powercfg /requests before/during/after protection, expiry while minimized,
  * manual sleep/resume, duplicate launch, startup from paths containing spaces,
  * AC and battery/Modern Standby. The UI scales with system DPI at startup.
+ * Shutdown release checks (use a disposable Windows VM with work saved):
+ * enable only shutdown protection; try normal shutdown, restart and sign-out;
+ * cancel each attempt and repeat with Awaken minimized. Confirm the Windows
+ * reason is shown and cancellation keeps protection active. Repeat after Stop,
+ * timer expiry and exit: Awaken must no longer block. Check startup --activate
+ * with the saved option and repeat with all protections enabled. Verify force
+ * termination/"Shut down anyway" overrides it; do not expect data preservation.
  * Cross-compilation and simulated tests cannot validate physical power behavior.
  * Binaries are unsigned; distribution signing requires your own certificate.
  */
@@ -162,6 +178,12 @@ static uint64_t RemainingSeconds(uint64_t milliseconds) {
     return milliseconds / 1000 + (milliseconds % 1000 != 0);
 }
 
+/* Query handling must remain nonblocking, even when the expiry timer is delayed. */
+static int ShouldBlockShutdown(int active, int registered, int critical,
+                               uint64_t endsAt, uint64_t now) {
+    return active && registered && !critical && (endsAt == 0 || now < endsAt);
+}
+
 #if defined(AWAKEN_LOGIC_TEST)
 
 #include <stdio.h>
@@ -195,6 +217,13 @@ int main(void) {
     CHECK(RemainingSeconds(1001) == 2);
     CHECK(RemainingSeconds(28800000) == 28800);
     CHECK(RemainingSeconds(UINT64_MAX) == UINT64_MAX / 1000 + 1);
+    CHECK(ShouldBlockShutdown(1, 1, 0, 0, UINT64_MAX));
+    CHECK(ShouldBlockShutdown(1, 1, 0, 1000, 999));
+    CHECK(!ShouldBlockShutdown(1, 1, 0, 1000, 1000));
+    CHECK(!ShouldBlockShutdown(1, 1, 0, 1000, 1001));
+    CHECK(!ShouldBlockShutdown(0, 1, 0, 0, 0));
+    CHECK(!ShouldBlockShutdown(1, 0, 0, 0, 0));
+    CHECK(!ShouldBlockShutdown(1, 1, 1, 0, 0));
     puts("Awaken logic tests passed");
     return 0;
 }
@@ -232,6 +261,12 @@ int main(void) {
 #ifdef AWAKEN_WINDOWS_TEST
 #include <stdio.h>
 #include <stdlib.h>
+static BOOL failShutdownCreate, failShutdownDestroy;
+static unsigned int shutdownCreates, shutdownDestroys;
+static BOOL WINAPI TestShutdownCreate(HWND hwnd, LPCWSTR reason);
+static BOOL WINAPI TestShutdownDestroy(HWND hwnd);
+#define ShutdownBlockReasonCreate TestShutdownCreate
+#define ShutdownBlockReasonDestroy TestShutdownDestroy
 static BOOL failTimer, failExecution, failPower, failPowerCreate;
 static BOOL failStandardControls, failAllControls;
 static unsigned int controlInitCalls;
@@ -271,10 +306,11 @@ static BOOL WINAPI TestInitCommonControlsEx(const INITCOMMONCONTROLSEX *controls
 #define ID_BUTTON_STOP             1007
 #define ID_STATUS_TEXT             1008
 #define ID_REMAINING_TEXT          1009
+#define ID_CHECK_SHUTDOWN          1010
 #define ID_TIMER_MAIN              2001
 
 #define WINDOW_WIDTH               620
-#define WINDOW_HEIGHT              600
+#define WINDOW_HEIGHT              676
 
 static const COLORREF APP_COLOR_BACKGROUND = RGB(246, 248, 251);
 static const COLORREF COLOR_TEXT = RGB(31, 41, 55);
@@ -287,6 +323,7 @@ typedef struct AppState {
     HWND checkSystemSleep;
     HWND checkDisplayOff;
     HWND checkScreensaver;
+    HWND checkShutdown;
     HWND comboDuration;
     HWND checkStartup;
     HWND buttonStart;
@@ -301,6 +338,7 @@ typedef struct AppState {
     HBRUSH backgroundBrush;
 
     BOOL active;
+    BOOL shutdownBlockApplied;
     BOOL executionStateApplied;
     HANDLE displayPowerRequestHandle;
     BOOL displayPowerRequestApplied;
@@ -624,6 +662,7 @@ static void LoadSettings(void) {
     Button_SetCheck(g_app.checkSystemSleep, BST_CHECKED);
     Button_SetCheck(g_app.checkDisplayOff, BST_CHECKED);
     Button_SetCheck(g_app.checkScreensaver, BST_CHECKED);
+    Button_SetCheck(g_app.checkShutdown, BST_UNCHECKED);
 
     if (ReadRegistryDword(L"PreventSystemSleep", &value)) {
         Button_SetCheck(g_app.checkSystemSleep, value ? BST_CHECKED : BST_UNCHECKED);
@@ -633,6 +672,9 @@ static void LoadSettings(void) {
     }
     if (ReadRegistryDword(L"PreventScreensaver", &value)) {
         Button_SetCheck(g_app.checkScreensaver, value ? BST_CHECKED : BST_UNCHECKED);
+    }
+    if (ReadRegistryDword(L"PreventShutdown", &value)) {
+        Button_SetCheck(g_app.checkShutdown, value ? BST_CHECKED : BST_UNCHECKED);
     }
     if (ReadRegistryDword(L"DurationIndex", &value) && value <= 6) {
         durationIndex = (int)value;
@@ -678,6 +720,8 @@ static void SaveSettings(void) {
         L"PreventScreensaver",
         Button_GetCheck(g_app.checkScreensaver) == BST_CHECKED
     ) && saved;
+    saved = WriteRegistryDword(key, L"PreventShutdown",
+        Button_GetCheck(g_app.checkShutdown) == BST_CHECKED) && saved;
     saved = WriteRegistryDword(
         key,
         L"DurationIndex",
@@ -695,6 +739,7 @@ static void SetConfigurationControlsEnabled(BOOL enabled) {
     EnableWindow(g_app.checkSystemSleep, enabled);
     EnableWindow(g_app.checkDisplayOff, enabled);
     EnableWindow(g_app.checkScreensaver, enabled);
+    EnableWindow(g_app.checkShutdown, enabled);
     EnableWindow(g_app.comboDuration, enabled);
     EnableWindow(g_app.buttonStart, enabled);
     EnableWindow(g_app.buttonStop, !enabled);
@@ -744,6 +789,7 @@ static void StartProtection(HWND hwnd) {
     BOOL preventSystemSleep = Button_GetCheck(g_app.checkSystemSleep) == BST_CHECKED;
     BOOL preventDisplayOff = Button_GetCheck(g_app.checkDisplayOff) == BST_CHECKED;
     BOOL preventScreensaver = Button_GetCheck(g_app.checkScreensaver) == BST_CHECKED;
+    BOOL preventShutdown = Button_GetCheck(g_app.checkShutdown) == BST_CHECKED;
     EXECUTION_STATE executionFlags = ES_CONTINUOUS;
     int durationMinutes;
 
@@ -751,7 +797,7 @@ static void StartProtection(HWND hwnd) {
         return;
     }
 
-    if (!preventSystemSleep && !preventDisplayOff && !preventScreensaver) {
+    if (!preventSystemSleep && !preventDisplayOff && !preventScreensaver && !preventShutdown) {
         MessageBoxW(
             hwnd,
             L"Select at least one protection option.",
@@ -794,6 +840,17 @@ static void StartProtection(HWND hwnd) {
         g_app.executionStateApplied = TRUE;
     }
 
+    if (preventShutdown) {
+        if (!ShutdownBlockReasonCreate(hwnd,
+                L"Awaken protection is active. Stop protection in Awaken to end this session.")) {
+            if (!StopProtection(hwnd)) return;
+            MessageBoxW(hwnd, L"Shutdown protection could not be registered. No protection is active.",
+                APP_TITLE, MB_OK | MB_ICONERROR);
+            return;
+        }
+        g_app.shutdownBlockApplied = TRUE;
+    }
+
     durationMinutes = DurationMinutesFromSelection(ComboBox_GetCurSel(g_app.comboDuration));
     g_app.startedAt = GetTickCount64();
     g_app.endsAt = durationMinutes > 0
@@ -833,6 +890,18 @@ static BOOL StopProtection(HWND hwnd) {
     }
 
     ClearPowerRequestDisplayRequired();
+    if (g_app.shutdownBlockApplied) {
+        if (!ShutdownBlockReasonDestroy(hwnd)) {
+            g_app.active = TRUE;
+            SetConfigurationControlsEnabled(FALSE);
+            SetWindowTextW(g_app.statusText, L"Shutdown protection could not be stopped");
+            SetWindowTextW(g_app.remainingText, L"Try Stop again, or close Awaken to release protection");
+            MessageBoxW(hwnd, L"Windows could not release shutdown protection. Try Stop again or close Awaken.",
+                APP_TITLE, MB_OK | MB_ICONERROR);
+            return FALSE;
+        }
+        g_app.shutdownBlockApplied = FALSE;
+    }
 
     g_app.active = FALSE;
     g_app.startedAt = 0;
@@ -907,7 +976,7 @@ static void CreateInterface(HWND hwnd) {
     groupProtection = CreateControl(
         0, L"BUTTON", L"Protection options",
         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        26, 112, 558, 176,
+        26, 112, 558, 214,
         hwnd, 0, g_app.fontNormal
     );
     (void)groupProtection;
@@ -933,10 +1002,17 @@ static void CreateInterface(HWND hwnd) {
         hwnd, ID_CHECK_SCREENSAVER, g_app.fontNormal
     );
 
+    g_app.checkShutdown = CreateControl(
+        0, L"BUTTON", L"Block shutdown, &restart and sign-out",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        48, 259, 500, 28,
+        hwnd, ID_CHECK_SHUTDOWN, g_app.fontNormal
+    );
+
     durationLabel = CreateControl(
         0, L"STATIC", L"D&uration:",
         WS_CHILD | WS_VISIBLE,
-        48, 258, 120, 24,
+        48, 296, 120, 24,
         hwnd, 0, g_app.fontNormal
     );
     (void)durationLabel;
@@ -944,7 +1020,7 @@ static void CreateInterface(HWND hwnd) {
     g_app.comboDuration = CreateControl(
         0, L"COMBOBOX", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-        174, 254, 210, 250,
+        174, 292, 210, 250,
         hwnd, ID_COMBO_DURATION, g_app.fontNormal
     );
 
@@ -959,7 +1035,7 @@ static void CreateInterface(HWND hwnd) {
     groupBehavior = CreateControl(
         0, L"BUTTON", L"Application",
         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        26, 302, 558, 74,
+        26, 340, 558, 74,
         hwnd, 0, g_app.fontNormal
     );
     (void)groupBehavior;
@@ -967,35 +1043,35 @@ static void CreateInterface(HWND hwnd) {
     g_app.checkStartup = CreateControl(
         0, L"BUTTON", L"Start Awaken with &Windows and activate protection",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-        48, 330, 500, 28,
+        48, 368, 500, 28,
         hwnd, ID_CHECK_STARTUP, g_app.fontNormal
     );
 
     g_app.statusText = CreateControl(
         0, L"STATIC", L"",
         WS_CHILD | WS_VISIBLE,
-        30, 398, 555, 28,
+        30, 436, 555, 28,
         hwnd, ID_STATUS_TEXT, g_app.fontButton
     );
 
     g_app.remainingText = CreateControl(
         0, L"STATIC", L"",
         WS_CHILD | WS_VISIBLE,
-        30, 426, 555, 24,
+        30, 464, 555, 24,
         hwnd, ID_REMAINING_TEXT, g_app.fontNormal
     );
 
     g_app.buttonStart = CreateControl(
         0, L"BUTTON", L"&Activate",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-        30, 462, 266, 42,
+        30, 500, 266, 42,
         hwnd, ID_BUTTON_START, g_app.fontButton
     );
 
     g_app.buttonStop = CreateControl(
         0, L"BUTTON", L"S&top",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        312, 462, 266, 42,
+        312, 500, 266, 42,
         hwnd, ID_BUTTON_STOP, g_app.fontButton
     );
 
@@ -1003,15 +1079,19 @@ static void CreateInterface(HWND hwnd) {
         0, L"STATIC",
         L"Manual sleep, screen lock and lid actions still work. Display protection alone does not prevent sleep.",
         WS_CHILD | WS_VISIBLE,
-        30, 516, 555, 36,
+        30, 554, 555, 36,
         hwnd, 0, g_app.fontSmall
     );
     (void)note;
 
+    CreateControl(0, L"STATIC",
+        L"Shutdown protection also blocks restart and sign-out. Forced shutdown and power loss can override it.",
+        WS_CHILD | WS_VISIBLE, 30, 592, 555, 36, hwnd, 0, g_app.fontSmall);
+
     footer = CreateControl(
         0, L"STATIC", L"Settings are stored in your user account; administrator privileges are not required.",
         WS_CHILD | WS_VISIBLE,
-        30, 554, 555, 36,
+        30, 630, 555, 36,
         hwnd, 0, g_app.fontSmall
     );
     (void)footer;
@@ -1075,7 +1155,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
 
             if ((controlId == ID_CHECK_SYSTEM_SLEEP ||
                  controlId == ID_CHECK_DISPLAY_OFF ||
-                 controlId == ID_CHECK_SCREENSAVER) &&
+                 controlId == ID_CHECK_SCREENSAVER ||
+                 controlId == ID_CHECK_SHUTDOWN) &&
                 notification == BN_CLICKED) {
                 SaveSettings();
                 return 0;
@@ -1147,8 +1228,22 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             DestroyWindow(hwnd);
             return 0;
 
+        case WM_QUERYENDSESSION:
+            /* Never show dialogs or release protection during a query: another
+             * application or the user can still cancel the shutdown. Critical
+             * termination cannot reliably be vetoed by a desktop application. */
+            return ShouldBlockShutdown(g_app.active, g_app.shutdownBlockApplied,
+                (lParam & ENDSESSION_CRITICAL) != 0, g_app.endsAt, GetTickCount64())
+                ? FALSE : TRUE;
+
         case WM_ENDSESSION:
             if (wParam) {
+                KillTimer(hwnd, ID_TIMER_MAIN);
+                g_app.active = FALSE;
+                if (g_app.shutdownBlockApplied) {
+                    ShutdownBlockReasonDestroy(hwnd);
+                    g_app.shutdownBlockApplied = FALSE;
+                }
                 if (g_app.executionStateApplied) {
                     SetThreadExecutionState(ES_CONTINUOUS);
                     g_app.executionStateApplied = FALSE;
@@ -1158,6 +1253,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             return 0;
 
         case WM_DESTROY:
+            /* Destroying the owning window also removes its shutdown reason. */
+            if (g_app.shutdownBlockApplied) {
+                ShutdownBlockReasonDestroy(hwnd);
+                g_app.shutdownBlockApplied = FALSE;
+            }
+            g_app.active = FALSE;
             if (g_app.executionStateApplied) {
                 SetThreadExecutionState(ES_CONTINUOUS);
                 g_app.executionStateApplied = FALSE;
@@ -1355,6 +1456,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
 
 #ifdef AWAKEN_WINDOWS_TEST
 
+#undef ShutdownBlockReasonCreate
+#undef ShutdownBlockReasonDestroy
 #undef MessageBoxW
 #undef SetTimer
 #undef SetThreadExecutionState
@@ -1364,6 +1467,20 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
 #define CHECK(condition) do { if (!(condition)) { \
     fprintf(stderr, "Failed at line %d: %s\n", __LINE__, #condition); exit(1); \
 } } while (0)
+
+static BOOL WINAPI TestShutdownCreate(HWND hwnd, LPCWSTR reason) {
+    CHECK(IsWindow(hwnd) && reason != NULL && reason[0] != L'\0');
+    if (failShutdownCreate) return FALSE;
+    ++shutdownCreates;
+    return TRUE;
+}
+
+static BOOL WINAPI TestShutdownDestroy(HWND hwnd) {
+    CHECK(IsWindow(hwnd));
+    if (failShutdownDestroy) return FALSE;
+    ++shutdownDestroys;
+    return TRUE;
+}
 
 static BOOL WINAPI TestInitCommonControlsEx(const INITCOMMONCONTROLSEX *controls) {
     ++controlInitCalls;
@@ -1488,6 +1605,98 @@ static void SelectOptions(BOOL sleep, BOOL display, BOOL saver) {
     Button_SetCheck(g_app.checkScreensaver, saver ? BST_CHECKED : BST_UNCHECKED);
 }
 
+/* Verify real API registration independently of the failure-injection stubs. */
+static void TestShutdownReasonApi(HWND hwnd) {
+    WCHAR reason[256];
+    DWORD count = ARRAYSIZE(reason);
+    CHECK(ShutdownBlockReasonCreate(hwnd, L"Awaken regression test"));
+    CHECK(ShutdownBlockReasonQuery(hwnd, reason, &count));
+    CHECK(wcscmp(reason, L"Awaken regression test") == 0);
+    CHECK(ShutdownBlockReasonDestroy(hwnd));
+}
+
+/* These tests send session messages only; they never shut down the test host. */
+static void TestShutdownProtection(HWND hwnd) {
+    unsigned int before;
+    CHECK(Button_GetCheck(g_app.checkShutdown) == BST_UNCHECKED);
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) == TRUE);
+    SelectOptions(FALSE, FALSE, FALSE);
+    Button_SetCheck(g_app.checkShutdown, BST_CHECKED);
+    failShutdownCreate = TRUE;
+    before = dialogs;
+    StartProtection(hwnd);
+    CHECK(!g_app.active && !g_app.shutdownBlockApplied && dialogs == before + 1);
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) == TRUE);
+    SelectOptions(TRUE, TRUE, TRUE);
+    StartProtection(hwnd);
+    CHECK(!g_app.active && !g_app.executionStateApplied && requests == clears);
+    failShutdownCreate = FALSE;
+    SelectOptions(FALSE, FALSE, FALSE);
+    failTimer = TRUE;
+    StartProtection(hwnd);
+    CHECK(!g_app.active && !g_app.shutdownBlockApplied && shutdownCreates == shutdownDestroys);
+    failTimer = FALSE;
+
+    ComboBox_SetCurSel(g_app.comboDuration, 0);
+    StartProtection(hwnd);
+    CHECK(g_app.active && g_app.shutdownBlockApplied);
+    CHECK(!IsWindowEnabled(g_app.checkShutdown));
+    before = shutdownCreates;
+    StartProtection(hwnd);
+    CHECK(shutdownCreates == before);
+    before = dialogs;
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) == FALSE);
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0, ENDSESSION_LOGOFF) == FALSE);
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0, ENDSESSION_CLOSEAPP) == FALSE);
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0,
+        ENDSESSION_CLOSEAPP | ENDSESSION_LOGOFF) == FALSE);
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0, ENDSESSION_CRITICAL) == TRUE);
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0,
+        ENDSESSION_CRITICAL | ENDSESSION_LOGOFF | ENDSESSION_CLOSEAPP) == TRUE);
+    CHECK(dialogs == before);
+    SendMessageW(hwnd, WM_ENDSESSION, FALSE, 0);
+    CHECK(g_app.active && g_app.shutdownBlockApplied);
+    ShowWindow(hwnd, SW_MINIMIZE);
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) == FALSE);
+    ShowWindow(hwnd, SW_HIDE);
+
+    failShutdownDestroy = TRUE;
+    CHECK(!StopProtection(hwnd));
+    CHECK(g_app.active && g_app.shutdownBlockApplied && IsWindowEnabled(g_app.buttonStop));
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) == FALSE);
+    failShutdownDestroy = FALSE;
+    CHECK(StopProtection(hwnd));
+    CHECK(!g_app.shutdownBlockApplied && shutdownCreates == shutdownDestroys);
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) == TRUE);
+    CHECK(StopProtection(hwnd));
+    CHECK(shutdownCreates == shutdownDestroys);
+
+    ComboBox_SetCurSel(g_app.comboDuration, 1);
+    StartProtection(hwnd);
+    g_app.endsAt = GetTickCount64();
+    CHECK(SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) == TRUE);
+    SendMessageW(hwnd, WM_TIMER, ID_TIMER_MAIN, 0);
+    CHECK(!g_app.active && !g_app.shutdownBlockApplied);
+    StartProtection(hwnd);
+    SendMessageW(hwnd, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
+    CHECK(!g_app.active && !g_app.shutdownBlockApplied);
+
+    StartProtection(hwnd);
+    SendMessageW(hwnd, WM_ENDSESSION, TRUE, ENDSESSION_CRITICAL);
+    CHECK(!g_app.active && !g_app.shutdownBlockApplied);
+    CHECK(shutdownCreates == shutdownDestroys);
+    SetConfigurationControlsEnabled(TRUE);
+    SaveSettings();
+    Button_SetCheck(g_app.checkShutdown, BST_UNCHECKED);
+    LoadSettings();
+    CHECK(Button_GetCheck(g_app.checkShutdown) == BST_CHECKED);
+    Button_SetCheck(g_app.checkShutdown, BST_UNCHECKED);
+    SaveSettings();
+    Button_SetCheck(g_app.checkShutdown, BST_CHECKED);
+    LoadSettings();
+    CHECK(Button_GetCheck(g_app.checkShutdown) == BST_UNCHECKED);
+}
+
 int main(void) {
     WNDCLASSW cls = {0};
     HANDLE closer;
@@ -1528,6 +1737,8 @@ int main(void) {
     CHECK(SetStartupEnabled(FALSE));
     CHECK(!IsStartupEnabled());
 
+    TestShutdownReasonApi(hwnd);
+    TestShutdownProtection(hwnd);
     SelectOptions(FALSE, FALSE, FALSE);
     before = dialogs;
     StartProtection(hwnd);
@@ -1608,7 +1819,12 @@ int main(void) {
     CHECK(!g_app.active && requests == clears);
     StartProtection(hwnd);
     CHECK(g_app.active);
+    CHECK(StopProtection(hwnd));
+    Button_SetCheck(g_app.checkShutdown, BST_CHECKED);
+    StartProtection(hwnd);
+    CHECK(g_app.shutdownBlockApplied);
     DestroyWindow(hwnd);
+    CHECK(!g_app.shutdownBlockApplied && shutdownCreates == shutdownDestroys);
     CHECK(requests == clears && lastExecution == ES_CONTINUOUS);
     /* WM_DESTROY posted WM_QUIT; start the entry-point smoke test with a clean queue. */
     while (PeekMessageW(&pending, NULL, 0, 0, PM_REMOVE)) { }
