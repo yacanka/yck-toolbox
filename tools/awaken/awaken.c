@@ -247,6 +247,15 @@ int main(void) {
 #include <shellapi.h>
 #include <string.h>
 
+/* Older Windows SDK/MinGW headers may omit these documented session flags.
+ * Keep SDK definitions when available; the message ABI values are fixed. */
+#ifndef ENDSESSION_CRITICAL
+#define ENDSESSION_CRITICAL 0x40000000
+#endif
+#ifndef ENDSESSION_CLOSEAPP
+#define ENDSESSION_CLOSEAPP 0x00000001
+#endif
+
 
 
 
