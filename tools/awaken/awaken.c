@@ -13,6 +13,10 @@
  *   x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror -mwindows -static awaken.c awaken.res -o awaken.exe -lcomctl32 -ladvapi32 -lshell32 -lgdi32 -luser32 -Wl,--dynamicbase,--nxcompat
  * Use i686-w64-mingw32-* for x86. Only awaken.exe is needed at runtime.
  * Dev-C++: compile this file as C (no AWAKEN_* test/resource defines).
+ * Set the project icon in Dev-C++ and rebuild its resources. Awaken loads the
+ * first usable embedded icon group for the title bar, taskbar and Alt+Tab.
+ * Named and numeric resource IDs are supported; no resource.h is needed.
+ * Without an embedded icon, Awaken uses a Windows fallback icon.
  * Linker options: -mwindows -static -lcomctl32 -ladvapi32 -lshell32 -lgdi32 -luser32
  * Resource and object files are build outputs, not additional source files.
  * Building only awaken.c also works with classic controls; include resources
@@ -64,6 +68,22 @@
 #if defined(AWAKEN_RESOURCES)
 
 #include <windows.h>
+#ifdef AWAKEN_ICON_TEST_RESOURCE
+/* A small synthetic icon verifies resource discovery without external .ico files.
+ * BGRA = 44 99 11 ff; the group ID intentionally differs from IDI_APPLICATION. */
+101 3
+BEGIN
+    40L, 1L, 2L, 1, 32, 0L, 4L, 0L, 0L, 0L, 0L, 0xff119944L, 0L
+END
+#ifdef AWAKEN_ICON_TEST_NUMERIC
+321 14
+#else
+"AWAKEN_TEST_ICON" 14
+#endif
+BEGIN
+    0, 1, 1, 0x0101, 0, 1, 32, 48L, 101
+END
+#endif
 1 RT_MANIFEST
 BEGIN
     "<?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?>"
@@ -321,14 +341,37 @@ typedef BOOL (WINAPI *AppPowerClearRequestFunction)(HANDLE requestHandle, int re
 #define APP_POWER_REQUEST_CONTEXT_SIMPLE_STRING 0x00000001UL
 static const int PowerRequestDisplayRequiredValue = 0;
 
-static HICON LoadApplicationIcon(HINSTANCE instance, int width, int height) {
-    /* Use a shared system icon; no missing external icon resource is required. */
-    HICON icon = LoadIconW(NULL, IDI_APPLICATION);
-    (void)instance;
-    (void)width;
-    (void)height;
+typedef struct IconLoadContext {
+    int width;
+    int height;
+    HICON icon;
+} IconLoadContext;
 
-    return icon;
+static BOOL CALLBACK LoadFirstIconResource(HMODULE module, LPCWSTR type, LPWSTR name, LONG_PTR parameter) {
+    IconLoadContext *context = (IconLoadContext *)parameter;
+    (void)type;
+    /* Dev-C++ may use a named resource or a numeric ID. Do not assume either.
+     * Owned handles avoid LR_SHARED returning the first cached size for both icons. */
+    context->icon = (HICON)LoadImageW(module, name, IMAGE_ICON,
+        context->width, context->height, LR_DEFAULTCOLOR);
+    return context->icon == NULL;
+}
+
+/* Returns an owned icon. The caller must release it after destroying the window. */
+static HICON LoadApplicationIcon(HINSTANCE instance, int width, int height) {
+    IconLoadContext context = {width, height, NULL};
+    EnumResourceNamesW(instance, RT_GROUP_ICON, LoadFirstIconResource, (LONG_PTR)&context);
+    if (context.icon != NULL) return context.icon;
+
+    /* A plain single-file build need not have an icon resource. Copy the shared
+     * system icon so both the embedded and fallback paths have the same ownership. */
+    return (HICON)CopyImage(LoadIconW(NULL, IDI_APPLICATION), IMAGE_ICON,
+        width, height, 0);
+}
+
+static void DestroyApplicationIcons(HICON largeIcon, HICON smallIcon) {
+    if (largeIcon != NULL) DestroyIcon(largeIcon);
+    if (smallIcon != NULL) DestroyIcon(smallIcon);
 }
 
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -1252,6 +1295,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
 
     if (!RegisterClassExW(&windowClass)) {
         ShowStartupError(L"The application window class could not be registered.", GetLastError());
+        DestroyApplicationIcons(largeIcon, smallIcon);
         CloseHandle(instanceMutex);
         return 1;
     }
@@ -1275,6 +1319,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
 
     if (hwnd == NULL) {
         ShowStartupError(L"The application window could not be created.", GetLastError());
+        UnregisterClassW(APP_CLASS_NAME, instance);
+        DestroyApplicationIcons(largeIcon, smallIcon);
         CloseHandle(instanceMutex);
         return 1;
     }
@@ -1301,6 +1347,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
         ShowStartupError(L"The Windows message loop failed.", GetLastError());
     }
     if (IsWindow(hwnd)) DestroyWindow(hwnd);
+    UnregisterClassW(APP_CLASS_NAME, instance);
+    DestroyApplicationIcons(largeIcon, smallIcon);
     CloseHandle(instanceMutex);
     return getMessageResult == -1 ? 1 : (int)message.wParam;
 }
@@ -1326,6 +1374,38 @@ static BOOL WINAPI TestInitCommonControlsEx(const INITCOMMONCONTROLSEX *controls
     return InitCommonControlsEx(controls);
 }
 
+static void CheckIcon(HICON icon, int width, int height) {
+    ICONINFO info;
+    BITMAP bitmap;
+    CHECK(icon != NULL);
+    CHECK(GetIconInfo(icon, &info));
+    CHECK(GetObjectW(info.hbmColor, sizeof(bitmap), &bitmap) == sizeof(bitmap));
+    CHECK(bitmap.bmWidth == width && bitmap.bmHeight == height);
+#ifdef AWAKEN_ICON_TEST_RESOURCE
+    {
+        HDC dc = CreateCompatibleDC(NULL);
+        HGDIOBJ previous;
+        CHECK(dc != NULL);
+        previous = SelectObject(dc, info.hbmColor);
+        CHECK(GetPixel(dc, 0, 0) == RGB(17, 153, 68));
+        SelectObject(dc, previous);
+        DeleteDC(dc);
+    }
+#endif
+    DeleteObject(info.hbmColor);
+    DeleteObject(info.hbmMask);
+}
+
+static void TestApplicationIcons(void) {
+    HINSTANCE instance = GetModuleHandleW(NULL);
+    HICON largeIcon = LoadApplicationIcon(instance, 32, 32);
+    HICON smallIcon = LoadApplicationIcon(instance, 16, 16);
+    CheckIcon(largeIcon, 32, 32);
+    CheckIcon(smallIcon, 16, 16);
+    CHECK(largeIcon != smallIcon);
+    DestroyApplicationIcons(largeIcon, smallIcon);
+}
+
 /* Exercise the real entry point and message loop, not just control creation. */
 static DWORD WINAPI CloseStartupWindow(LPVOID unused) {
     unsigned int attempt;
@@ -1333,6 +1413,12 @@ static DWORD WINAPI CloseStartupWindow(LPVOID unused) {
     for (attempt = 0; attempt < 100; ++attempt) {
         HWND window = FindWindowW(APP_CLASS_NAME, NULL);
         if (window != NULL && IsWindowVisible(window)) {
+            CheckIcon((HICON)SendMessageW(window, WM_GETICON, ICON_BIG, 0),
+                GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+            CheckIcon((HICON)SendMessageW(window, WM_GETICON, ICON_SMALL, 0),
+                GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+            CHECK(GetClassLongPtrW(window, GCLP_HICON) != 0);
+            CHECK(GetClassLongPtrW(window, GCLP_HICONSM) != 0);
             PostMessageW(window, WM_CLOSE, 0, 0);
             return 0;
         }
@@ -1413,6 +1499,7 @@ int main(void) {
     HKEY key;
     DWORD invalid = 99;
     CHECK(InitializeInterfaceControls());
+    TestApplicationIcons();
     failStandardControls = TRUE;
     controlInitCalls = 0;
     CHECK(InitializeInterfaceControls());
