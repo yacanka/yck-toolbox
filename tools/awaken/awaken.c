@@ -35,7 +35,10 @@
  * No test code or test Registry overrides are included in the normal executable.
  *
  * Usage: select protection, select a duration, then Activate. Stop, expiry or
- * closing the window releases requests. Minimize keeps protection active.
+ * closing the window releases requests. Minimize hides the window in the
+ * notification area and requests a brief background notification. Click the
+ * icon to reopen without restarting protection or its timer. Windows notification
+ * settings may suppress the balloon or place the icon in the overflow menu.
  * Tab/Shift+Tab navigate; Space toggles; Alt+A activates; Alt+T stops;
  * Alt+D toggles display protection; Alt+R toggles shutdown protection;
  * Alt+U selects duration.
@@ -77,6 +80,10 @@
  * timer expiry and exit: Awaken must no longer block. Check startup --activate
  * with the saved option and repeat with all protections enabled. Verify force
  * termination/"Shut down anyway" overrides it; do not expect data preservation.
+ * Tray release checks: minimize while active/inactive, click the tray icon or
+ * its notification, restore via a second launch, and expire while hidden.
+ * Restart Explorer while hidden; verify icon recovery. Close after restoring
+ * and verify icon removal. Check notification suppression and tray overflow.
  * Cross-compilation and simulated tests cannot validate physical power behavior.
  * Binaries are unsigned; distribution signing requires your own certificate.
  */
@@ -278,6 +285,10 @@ static BOOL WINAPI TestShutdownDestroy(HWND hwnd);
 static BOOL failTimer, failExecution, failPower, failPowerCreate;
 static BOOL failStandardControls, failAllControls;
 static unsigned int controlInitCalls;
+static BOOL failTrayAdd, failTrayVersion, failTrayNotification;
+static unsigned int trayAdds, trayDeletes, trayNotifications;
+static NOTIFYICONDATAW lastTrayIcon;
+static BOOL WINAPI TestShellNotifyIconW(DWORD operation, PNOTIFYICONDATAW data);
 static unsigned int dialogs, requests, clears, executionCalls;
 static EXECUTION_STATE lastExecution;
 static int WINAPI TestMessageBoxW(HWND hwnd, LPCWSTR text, LPCWSTR title, UINT type);
@@ -293,6 +304,7 @@ static BOOL WINAPI TestInitCommonControlsEx(const INITCOMMONCONTROLSEX *controls
 #define SetThreadExecutionState TestExecutionState
 #define GetProcAddress TestGetProcAddress
 #define InitCommonControlsEx TestInitCommonControlsEx
+#define Shell_NotifyIconW TestShellNotifyIconW
 #endif
 
 #define APP_CLASS_NAME             L"AwakenWindowClass"
@@ -316,6 +328,8 @@ static BOOL WINAPI TestInitCommonControlsEx(const INITCOMMONCONTROLSEX *controls
 #define ID_REMAINING_TEXT          1009
 #define ID_CHECK_SHUTDOWN          1010
 #define ID_TIMER_MAIN              2001
+#define ID_TRAY_ICON               1
+#define WM_APP_TRAY                (WM_APP + 1)
 
 #define WINDOW_WIDTH               620
 #define WINDOW_HEIGHT              676
@@ -352,6 +366,8 @@ typedef struct AppState {
     BOOL displayPowerRequestApplied;
     int dpi;
     BOOL interfaceFailed;
+    BOOL trayIconAdded;
+    UINT taskbarCreatedMessage;
 
     ULONGLONG startedAt;
     ULONGLONG endsAt;
@@ -1156,14 +1172,96 @@ static LRESULT HandleControlColor(HDC hdc, HWND control) {
     return (LRESULT)g_app.backgroundBrush;
 }
 
+static void InitializeTrayData(HWND hwnd, NOTIFYICONDATAW *data) {
+    ZeroMemory(data, sizeof(*data));
+    data->cbSize = sizeof(*data);
+    data->hWnd = hwnd;
+    data->uID = ID_TRAY_ICON;
+}
+
+static void RemoveTrayIcon(HWND hwnd) {
+    NOTIFYICONDATAW data;
+    if (!g_app.trayIconAdded) return;
+    InitializeTrayData(hwnd, &data);
+    Shell_NotifyIconW(NIM_DELETE, &data);
+    g_app.trayIconAdded = FALSE;
+}
+
+static BOOL AddTrayIcon(HWND hwnd) {
+    NOTIFYICONDATAW data;
+    if (g_app.trayIconAdded) return TRUE;
+    /* Without the recovery message, a shell restart could strand a hidden window. */
+    if (g_app.taskbarCreatedMessage == 0) return FALSE;
+    InitializeTrayData(hwnd, &data);
+    data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+    data.uCallbackMessage = WM_APP_TRAY;
+    data.hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0);
+    if (data.hIcon == NULL) data.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    StringCchCopyW(data.szTip, ARRAYSIZE(data.szTip), L"Awaken - click to open");
+    if (!Shell_NotifyIconW(NIM_ADD, &data)) return FALSE;
+    data.uVersion = NOTIFYICON_VERSION_4;
+    if (!Shell_NotifyIconW(NIM_SETVERSION, &data)) {
+        Shell_NotifyIconW(NIM_DELETE, &data);
+        return FALSE;
+    }
+    g_app.trayIconAdded = TRUE;
+    return TRUE;
+}
+
+static void RestoreFromTray(HWND hwnd) {
+    ShowWindow(hwnd, SW_RESTORE);
+    RemoveTrayIcon(hwnd);
+    SetForegroundWindow(hwnd);
+}
+
+static void MinimizeToTray(HWND hwnd) {
+    NOTIFYICONDATAW data;
+    if (g_app.trayIconAdded || !AddTrayIcon(hwnd)) return;
+    ShowWindow(hwnd, SW_HIDE);
+    InitializeTrayData(hwnd, &data);
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+    StringCchCopyW(data.szInfoTitle, ARRAYSIZE(data.szInfoTitle), APP_TITLE);
+    StringCchCopyW(data.szInfo, ARRAYSIZE(data.szInfo),
+        L"Awaken is running in the background. Click the icon to open it.");
+    /* Notifications are best effort; suppressed balloons must not undo hiding. */
+    Shell_NotifyIconW(NIM_MODIFY, &data);
+}
+
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (g_app.taskbarCreatedMessage != 0 && message == g_app.taskbarCreatedMessage) {
+        if (g_app.trayIconAdded) {
+            g_app.trayIconAdded = FALSE;
+            if (!AddTrayIcon(hwnd)) RestoreFromTray(hwnd);
+        }
+        return 0;
+    }
     switch (message) {
         case WM_CREATE:
             g_app.hwnd = hwnd;
+            g_app.taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
             g_app.backgroundBrush = CreateSolidBrush(APP_COLOR_BACKGROUND);
             CreateInterface(hwnd);
             if (g_app.interfaceFailed || !g_app.backgroundBrush || !g_app.fontNormal ||
                 !g_app.fontSmall || !g_app.fontTitle || !g_app.fontButton) return -1;
+            return 0;
+
+        case WM_SIZE:
+            if (wParam == SIZE_MINIMIZED) MinimizeToTray(hwnd);
+            else RemoveTrayIcon(hwnd);
+            return 0;
+
+        case WM_SHOWWINDOW:
+            /* Also handles restoring the window from a second application launch. */
+            if (wParam) RemoveTrayIcon(hwnd);
+            break;
+
+        case WM_APP_TRAY:
+            if (g_app.trayIconAdded && HIWORD(lParam) == ID_TRAY_ICON &&
+                (LOWORD(lParam) == NIN_SELECT || LOWORD(lParam) == NIN_KEYSELECT ||
+                 LOWORD(lParam) == NIN_BALLOONUSERCLICK)) {
+                RestoreFromTray(hwnd);
+            }
             return 0;
 
         case WM_COMMAND: {
@@ -1294,6 +1392,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             return 0;
 
         case WM_DESTROY:
+            RemoveTrayIcon(hwnd);
             /* Destroying the owning window also removes its shutdown reason. */
             if (g_app.shutdownBlockApplied) {
                 AppDestroyShutdownBlock(hwnd);
@@ -1470,7 +1569,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)largeIcon);
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)smallIcon);
 
-    /* A launcher may request SW_HIDE; Awaken has no tray UI to recover it. */
+    /* SW_HIDE alone is not a user request to minimize to the notification area. */
     ShowWindow(hwnd, showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
     UpdateWindow(hwnd);
 
@@ -1502,10 +1601,37 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
 #undef SetThreadExecutionState
 #undef GetProcAddress
 #undef InitCommonControlsEx
+#undef Shell_NotifyIconW
 
 #define CHECK(condition) do { if (!(condition)) { \
     fprintf(stderr, "Failed at line %d: %s\n", __LINE__, #condition); exit(1); \
 } } while (0)
+
+/* Shell calls are simulated; window messages, visibility and protection are real. */
+static BOOL WINAPI TestShellNotifyIconW(DWORD operation, PNOTIFYICONDATAW data) {
+    CHECK(data->cbSize == sizeof(*data) && IsWindow(data->hWnd));
+    if (operation == NIM_ADD) {
+        CHECK(data->hIcon != NULL);
+        CHECK((data->uFlags & (NIF_ICON | NIF_MESSAGE | NIF_TIP)) ==
+            (NIF_ICON | NIF_MESSAGE | NIF_TIP));
+        if (failTrayAdd) return FALSE;
+        lastTrayIcon = *data;
+        ++trayAdds;
+    } else if (operation == NIM_SETVERSION) {
+        CHECK(data->uVersion == NOTIFYICON_VERSION_4);
+        return !failTrayVersion;
+    } else if (operation == NIM_MODIFY && (data->uFlags & NIF_INFO)) {
+        CHECK(!IsWindowVisible(data->hWnd));
+        CHECK(data->szInfo[0] != L'\0' && data->szInfoTitle[0] != L'\0');
+        ++trayNotifications;
+        return !failTrayNotification;
+    } else if (operation == NIM_DELETE) {
+        ++trayDeletes;
+    } else {
+        CHECK(FALSE);
+    }
+    return TRUE;
+}
 
 static BOOL WINAPI TestShutdownCreate(HWND hwnd, LPCWSTR reason) {
     CHECK(IsWindow(hwnd) && reason != NULL && reason[0] != L'\0');
@@ -1654,6 +1780,79 @@ static void SelectOptions(BOOL sleep, BOOL display, BOOL saver) {
     Button_SetCheck(g_app.checkSystemSleep, sleep ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(g_app.checkDisplayOff, display ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(g_app.checkScreensaver, saver ? BST_CHECKED : BST_UNCHECKED);
+}
+
+static void ClickTrayIcon(HWND hwnd, UINT event) {
+    CHECK(lastTrayIcon.uCallbackMessage != 0);
+    SendMessageW(hwnd, lastTrayIcon.uCallbackMessage, 0,
+        MAKELPARAM(event, lastTrayIcon.uID));
+}
+
+static void TestTrayLifecycle(HWND hwnd) {
+    unsigned int adds = trayAdds;
+    unsigned int notifications = trayNotifications;
+    ULONGLONG startedAt, endsAt;
+    UINT taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    CHECK(taskbarCreated != 0);
+    SelectOptions(TRUE, TRUE, TRUE);
+    ComboBox_SetCurSel(g_app.comboDuration, 1);
+    StartProtection(hwnd);
+    startedAt = g_app.startedAt;
+    endsAt = g_app.endsAt;
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    ShowWindow(hwnd, SW_MINIMIZE);
+    CHECK(!IsWindowVisible(hwnd));
+    CHECK(trayAdds == adds + 1 && trayNotifications == notifications + 1);
+    CHECK(g_app.active && g_app.startedAt == startedAt && g_app.endsAt == endsAt);
+    ClickTrayIcon(hwnd, NIN_SELECT);
+    CHECK(IsWindowVisible(hwnd) && !IsIconic(hwnd));
+    CHECK(g_app.active && g_app.endsAt == endsAt);
+    CHECK(trayDeletes == trayAdds);
+
+    failTrayAdd = TRUE;
+    ShowWindow(hwnd, SW_MINIMIZE);
+    CHECK(IsWindowVisible(hwnd));
+    CHECK(g_app.active && g_app.endsAt == endsAt);
+    ShowWindow(hwnd, SW_RESTORE);
+    failTrayAdd = FALSE;
+    failTrayVersion = TRUE;
+    ShowWindow(hwnd, SW_MINIMIZE);
+    CHECK(IsWindowVisible(hwnd) && trayDeletes == trayAdds);
+    ShowWindow(hwnd, SW_RESTORE);
+    failTrayVersion = FALSE;
+
+    failTrayNotification = TRUE;
+    ShowWindow(hwnd, SW_MINIMIZE);
+    CHECK(!IsWindowVisible(hwnd));
+    ClickTrayIcon(hwnd, NIN_KEYSELECT);
+    CHECK(IsWindowVisible(hwnd) && !IsIconic(hwnd));
+    failTrayNotification = FALSE;
+    ShowWindow(hwnd, SW_MINIMIZE);
+    adds = trayAdds;
+    notifications = trayNotifications;
+    SendMessageW(hwnd, taskbarCreated, 0, 0);
+    CHECK(!IsWindowVisible(hwnd) && trayAdds == adds + 1);
+    CHECK(trayNotifications == notifications);
+    failTrayAdd = TRUE;
+    SendMessageW(hwnd, taskbarCreated, 0, 0);
+    CHECK(IsWindowVisible(hwnd) && !IsIconic(hwnd));
+    failTrayAdd = FALSE;
+
+    ShowWindow(hwnd, SW_MINIMIZE);
+    adds = trayDeletes;
+    /* A second launch uses ShowWindow(SW_RESTORE), not the tray callback. */
+    ShowWindow(hwnd, SW_RESTORE);
+    CHECK(IsWindowVisible(hwnd) && trayDeletes == adds + 1);
+    ShowWindow(hwnd, SW_MINIMIZE);
+    g_app.endsAt = GetTickCount64();
+    SendMessageW(hwnd, WM_TIMER, ID_TIMER_MAIN, 0);
+    CHECK(!g_app.active && !IsWindowVisible(hwnd));
+    ClickTrayIcon(hwnd, NIN_BALLOONUSERCLICK);
+    CHECK(IsWindowVisible(hwnd) && !IsIconic(hwnd));
+    ShowWindow(hwnd, SW_MINIMIZE);
+    CHECK(!IsWindowVisible(hwnd));
+    ClickTrayIcon(hwnd, NIN_SELECT);
+    CHECK(!g_app.active && IsWindowVisible(hwnd));
 }
 
 /* Verify real API registration independently of the failure-injection stubs. */
@@ -1818,6 +2017,7 @@ int main(void) {
     CHECK(SetStartupEnabled(FALSE));
     CHECK(!IsStartupEnabled());
 
+    TestTrayLifecycle(hwnd);
     TestShutdownReasonApi(hwnd);
     TestShutdownProtection(hwnd);
     SelectOptions(FALSE, FALSE, FALSE);
@@ -1904,7 +2104,12 @@ int main(void) {
     Button_SetCheck(g_app.checkShutdown, BST_CHECKED);
     StartProtection(hwnd);
     CHECK(g_app.shutdownBlockApplied);
-    DestroyWindow(hwnd);
+    ShowWindow(hwnd, SW_RESTORE);
+    ShowWindow(hwnd, SW_MINIMIZE);
+    CHECK(!IsWindowVisible(hwnd));
+    before = trayDeletes;
+    SendMessageW(hwnd, WM_CLOSE, 0, 0);
+    CHECK(!IsWindow(hwnd) && trayDeletes == before + 1);
     CHECK(!g_app.shutdownBlockApplied && shutdownCreates == shutdownDestroys);
     CHECK(requests == clears && lastExecution == ES_CONTINUOUS);
     /* WM_DESTROY posted WM_QUIT; start the entry-point smoke test with a clean queue. */
