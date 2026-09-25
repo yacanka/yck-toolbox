@@ -263,6 +263,15 @@ int main(void) {
 #define ENDSESSION_CLOSEAPP 0x00000001
 #endif
 
+/* Older MinGW shell headers may omit these Vista-era constants. Windows 10/11
+ * support their fixed ABI values; preserve definitions supplied by newer SDKs. */
+#ifndef NIF_SHOWTIP
+#define NIF_SHOWTIP 0x00000080
+#endif
+#ifndef NOTIFYICON_VERSION_4
+#define NOTIFYICON_VERSION_4 4
+#endif
+
 
 
 
