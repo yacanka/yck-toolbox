@@ -24,8 +24,8 @@ macOS/Linux'ta Tk desteği olan Python ile `python3 excel_fusion_gui.py` çalı�
 2. **Alt klasöre göre:** her ilk düzey alt klasör ayrı rapor grubu olur. Ana klasördeki
    dosyaları dahil etmek için ilgili kutuyu işaretleyin.
 3. **Sayfa adına göre:** aynı adlı sayfalar tüm alt klasörlerden ve ana klasörden birleştirilir.
-4. Gerekirse başlık satırı ve arama son satırını değiştirin. Arama ilk satırdan başlar;
-   başlık satırı tercih edilen konumdur. Diğer eşleştirme kuralları çekirdekteki ayarlardan alınır.
+4. **Sütunlar**, **Eşleştirme**, **Satır kuralları** ve **Rapor** sekmelerinden ayarları
+   düzenleyin. Başlık aramasının başlangıcı ve sonu seçilebilir; başlık satırı tercih edilen konumdur.
 5. **Ön kontrol** Excel üretmeden denetim çıkarır. **Rapor oluştur** Excel, denetim ve log üretir.
 6. İşlem bitince raporu veya çıktı klasörünü açın. Uyarı, hata, boş sonuç ve karantina
    sayıları ayrıca gösterilir; denetim sayfaları ayrıntıları içerir.
@@ -35,7 +35,51 @@ Kaynak dosyalar değiştirilmez. Var olan kaynak Excel'in üzerine yazılamaz.
 Ön kontrol dahil her çalıştırma aynı çıktı adına ait `.log` ve `.denetim.jsonl` dosyalarını yeniler.
 Bu dosyalar kaynak verileri içerebilir; raporla aynı erişim kurallarıyla saklayın.
 İşlem sürerken yeni işlem başlatma ve pencere kapatma engellenir. Zorla iptal düğmesi yoktur.
-Arayüz ayarları oturumluk kullanılır; kullanıcı yolları ayrıca kaydedilmez.
+Arayüz motorun mevcut `CONFIG` ve `COLUMN_SCHEMA` değerleriyle açılır. Her çalışma bağımsız
+bir ayar kopyası kullanır; motorun kaynak kodu ve global ayarları değiştirilmez.
+
+### Dinamik ayarlar ve sütunlar
+
+- **Dosyalar:** yollar, gruplama, uzantılar, hariç tutulan klasör/dosya/sayfalar,
+  gizli sayfalar ve hata/yenileme seçenekleri.
+- **Sütunlar:** sütun ekleme, silme, yukarı/aşağı taşıma; standart ad, alternatif
+  başlıklar, başlıkta zorunluluk, özel benzerlik eşiği ve Excel genişliği.
+  Değişikliği **Sütunu uygula** ile onaylayın. Boş özel eşik genel eşiği kullanır.
+- **Eşleştirme:** başlık aralığı/yüksekliği, metin okuma modu, referans sütunları,
+  minimum eşleşme sayıları ve benzerlik eşikleri.
+- **Satır kuralları:** doluluk koşulları, kayıt kimliği/regex, dipnot etiketleri,
+  metin temizleme, üstten doldurma ve tekrar kontrolü. Boş kayıt kimliği seçimi
+  kaynak Excel satır numarasını kullanır.
+- **Rapor:** başlık ve özet sayfası, ek sütun öneki, tarih biçimleri, sayfa satır sınırı,
+  en fazla dört grafik ve iş akışı özeti. Motorun renk paleti ve sabit rapor metinleri değişmez.
+
+Listelerde değeri seçip/yazıp **Ekle** düğmesine basın; seçili öğeyi **Sil** ile kaldırın.
+Tamamlanmamış liste veya sütun girişleri kaydetme/çalıştırma öncesinde bildirilir.
+Sayfa adına göre gruplamada kök dosyalar otomatik dahil edilir. Kullanılmayan seçenekler
+devre dışı görünür; değerleri korunur. İşlem sürerken tüm düzenleme kontrolleri kilitlenir.
+
+**Başlıkta zorunlu** işareti, sütun bulunmayan sayfanın alınmamasını sağlar.
+**Her satırda dolu olması gereken sütunlar** ise boş değeri olan satırı karantinaya alır.
+Bu listede **Şema sütunu** bağlantısı yeniden adlandırmayı izler. **Kaynak başlığı**
+serbest metindir ve aynı kalır; şemada bulunmayan kaynak başlıkları da kullanılabilir.
+Listeden sütun seçmek şema bağlantısını seçer; gerekirse yanındaki türü değiştirin.
+Bağlantısı bulunan sütun silinmeden önce ilgili seçimler kaldırılmalıdır.
+
+### JSON ayar profilleri
+
+**Profil kaydet** ile ayarları ve sütun sırasını UTF-8 JSON dosyasına kaydedin;
+**Profil yükle** ile tekrar kullanın. Son oturum otomatik kaydedilmez.
+Kaynak/çıktı yolları ve raporun üzerine yazma izni profile dahil edilmez. Profil yükleme
+ve **Varsayılanlara dön**, mevcut yolları korur ve yenileme iznini kapatır.
+Kaydedilmemiş değişiklikler yükleme, sıfırlama ve kapanış öncesinde bildirilir.
+
+Profil sürümü `1` olup `version`, `config`, `columns` ve isteğe bağlı
+`required_column_refs` alanlarını içerir. Son alan yalnızca arayüzdeki zorunlu sütun
+bağlantılarını saklar; motorun veri formatı değişmez. Eski/elle yazılmış profillerde bu
+alan yoksa zorunlu sütun adları kaynak başlığı olarak korunur. Eksik konfigürasyon
+anahtarları güncel motor varsayılanlarından tamamlanır. Bilinmeyen alan, desteklenmeyen
+sürüm veya geçersiz değer varsa profil reddedilir ve mevcut form korunur.
+Yazma başarısız olursa mevcut profil dosyası korunur.
 
 `CONFIG["ROW_REQUIRED_COLUMNS"]`, `COLUMN_SCHEMA` listesinden bağımsız ve öncelikli
 bir karantina kuralıdır. Örneğin `"ROW_REQUIRED_COLUMNS": ("Entity", "Notes")`
@@ -128,6 +172,8 @@ Kaynaklar: [PyInstaller çalışma modeli](https://pyinstaller.org/en/stable/ope
 
 - `excel_fusion.py`: sütun eşleştirme, karantina ve raporlama motoru.
 - `fusion_service.py`: ayar/yol doğrulaması ve motor çağrıları. `CONFIG` değiştirilmez.
+- `fusion_settings.py`: ayar alanları, şema bağlantıları, doğrulama ve atomik JSON profil kaydı.
+- `fusion_settings_ui.py`: sekmeli ayar formu, liste/grafik ve sütun düzenleyicileri.
 - `excel_fusion_gui.py`: Tkinter kabuğu; tek işçi thread, kuyruk üzerinden UI güncellemeleri.
 - `fusion_smoke.py`: paket içindeki Tk penceresi açıldıktan sonra Excel doğrulaması.
 - `fusion_diagnostics.py`: test ve paket kontrolü için sabit örnek ayarlar/şema.
@@ -142,10 +188,20 @@ Kaynaklar: [PyInstaller çalışma modeli](https://pyinstaller.org/en/stable/ope
 
 ```sh
 python -m unittest discover -v
-python -m compileall -q excel_fusion_gui.py fusion_service.py fusion_smoke.py collect_licenses.py
+python -m compileall -q excel_fusion_gui.py fusion_settings.py fusion_settings_ui.py fusion_service.py fusion_smoke.py collect_licenses.py
 python excel_fusion_gui.py --smoke-test smoke-result.json
 ```
 
 Son komut ekran oturumu gerektirir ve gerçek bir Tk penceresini kısa süre açar.
+`test_fusion_settings.py` ve servis testleri ekran gerektirmez. Gerçek arayüz testlerini
+Tk destekli Python ve açık ekran oturumunda ayrıca çalıştırın:
+
+```sh
+FUSION_GUI_TESTS=1 python -m unittest test_fusion_gui -v
+```
+
+Windows cmd.exe için önce `set FUSION_GUI_TESTS=1`, ardından
+`python -m unittest test_fusion_gui -v` çalıştırın. Normal test keşfi bu ekran testlerini
+açıkça atlar; paketleme smoke testi gerçek pencereyi ayrıca açar.
 XLS/XLSB için paket kontrolü native modülün yüklenmesini doğrular; gerçek legacy dosya
 uyumluluğu mevcut çekirdeğe bağlıdır ve örnek XLS/XLSB dosyasıyla ayrıca doğrulanmalıdır.

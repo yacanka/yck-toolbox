@@ -3,6 +3,7 @@ import copy
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ import openpyxl
 import excel_fusion as core
 from fusion_diagnostics import sample_configuration
 from fusion_service import RunOptions, run_report, validate_paths
+from fusion_settings import default_settings, rename_column
 
 
 class ServiceTests(unittest.TestCase):
@@ -131,6 +133,67 @@ class ServiceTests(unittest.TestCase):
         finally:
             cli.close()
             gui.close()
+
+    def test_custom_schema_and_config_match_direct_engine(self):
+        original_config = copy.deepcopy(core.CONFIG)
+        original_schema = list(core.COLUMN_SCHEMA)
+        settings = rename_column(default_settings(), 'Entity', 'Varlık')
+        settings.columns = tuple(replace(column, aliases=(*column.aliases, 'Entity'))
+                                 if column.name == 'Varlık' else column for column in settings.columns)
+        settings.config.update(REPORT_TITLE='Özel rapor', CHARTS=(('Varlık', 'bar'),))
+        options = replace(self.options, settings=settings)
+        report_type = core.Report
+        generated_at = datetime(2026, 1, 1, 12, tzinfo=UTC)
+        with patch.object(core, 'Report', side_effect=lambda root, output: report_type(
+                root, output, generated_at=generated_at)):
+            result = run_report(options)
+        report = core.Report(Path(options.source), self.root / 'direct.xlsx', generated_at=generated_at)
+        cfg = options.config()
+        core.discover(report, cfg)
+        core.collect(report, cfg, settings.columns)
+        core.save_report(report, cfg, settings.columns)
+        direct = openpyxl.load_workbook(report.output)
+        gui = openpyxl.load_workbook(result.output)
+        try:
+            self.assertEqual(gui.sheetnames, direct.sheetnames)
+            for name in gui.sheetnames:
+                self.assertEqual(list(gui[name].values), list(direct[name].values))
+            self.assertEqual(gui['Grup A']['B7'].value, 'Varlık')
+            self.assertEqual(len(gui[cfg['SUMMARY_SHEET']]._charts), 1)
+        finally:
+            direct.close()
+            gui.close()
+        self.assertEqual(core.CONFIG, original_config)
+        self.assertEqual(core.COLUMN_SCHEMA, original_schema)
+
+    def test_options_snapshot_and_legacy_field_precedence(self):
+        settings = default_settings()
+        settings.config.update(ROW_REQUIRED_COLUMNS=('Notes',), REPORT_GROUP_MODE='sheet_name')
+        options = replace(self.options, dry_run=True, settings=settings)
+        settings.config['ROW_REQUIRED_COLUMNS'] = ()
+        self.assertEqual(options.config()['REPORT_GROUP_MODE'], 'subfolder')
+        result = run_report(options)
+        self.assertEqual((result.records, result.quarantined), (0, 1))
+        self.assertEqual(core.CONFIG['ROW_REQUIRED_COLUMNS'], ())
+
+    def test_invalid_custom_settings_fail_before_any_output(self):
+        settings = default_settings()
+        settings.config['CHARTS'] = (('Absent', 'bar'),)
+        with self.assertRaises(ValueError):
+            run_report(replace(self.options, settings=settings))
+        self.assertFalse(Path(self.options.output).parent.exists())
+
+    def test_required_schema_reference_survives_rename_with_alias_header(self):
+        workbook = openpyxl.load_workbook(self.source)
+        workbook.active['B1'] = 'Kurum'
+        workbook.save(self.source)
+        workbook.close()
+        settings = default_settings()
+        settings.config['ROW_REQUIRED_COLUMNS'] = ('Entity',)
+        settings.required_column_refs = ('Entity',)
+        settings = rename_column(settings, 'Entity', 'Varlık')
+        result = run_report(replace(self.options, settings=settings))
+        self.assertEqual((result.records, result.quarantined), (1, 0))
 
 
 if __name__ == "__main__":

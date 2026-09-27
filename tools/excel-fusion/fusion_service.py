@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import excel_fusion as core
+from fusion_settings import FusionSettings, default_settings, validate_settings
 
 
 @dataclass(frozen=True)
@@ -21,16 +22,30 @@ class RunOptions:
     header_row: int = 12
     search_end: int = 40
     fail_on_error: bool = False
+    settings: FusionSettings | None = None
+
+    def __post_init__(self) -> None:
+        # Freeze the caller's mutable form state before dispatching a worker.
+        if self.settings is not None:
+            object.__setattr__(self, 'settings', copy.deepcopy(self.settings))
 
     def config(self) -> dict:
-        cfg = copy.deepcopy(core.CONFIG)
+        return self.resolved_settings().config
+
+    def resolved_settings(self) -> FusionSettings:
+        """Return a run-local copy. Legacy RunOptions fields retain precedence."""
+        settings = copy.deepcopy(self.settings) if self.settings is not None else default_settings()
+        cfg = settings.config
         cfg.update(REPORT_GROUP_MODE=self.group_mode, INCLUDE_ROOT_FILES=self.include_root,
                    OVERWRITE=self.overwrite, EXPECTED_HEADER_ROW=self.header_row,
                    HEADER_SEARCH_END=self.search_end, FAIL_ON_FILE_ERROR=self.fail_on_error)
         if not 1 <= self.header_row <= self.search_end <= 1_048_576:
             raise ValueError("Başlık satırı 1 ile arama sonu arasında olmalı; üst sınır 1048576.")
-        core.validate(cfg, core.COLUMN_SCHEMA)
-        return cfg
+        if self.settings is None:
+            core.validate(cfg, settings.columns)
+        else:
+            validate_settings(settings)
+        return settings
 
 
 @dataclass(frozen=True)
@@ -70,7 +85,8 @@ def run_report(options: RunOptions, progress: Callable[[str], None] = lambda _: 
     Dry runs still write audit and log files, matching the original CLI.
     The caller must serialize runs because the engine owns a shared logger.
     """
-    cfg = options.config()
+    settings = options.resolved_settings()
+    cfg, schema = settings.config, settings.columns
     root, output = validate_paths(options)
     output.parent.mkdir(parents=True, exist_ok=True)
     handler = logging.FileHandler(output.with_suffix(".log"), encoding="utf-8", mode="w")
@@ -85,7 +101,7 @@ def run_report(options: RunOptions, progress: Callable[[str], None] = lambda _: 
         count = (len(report.source_files) if options.group_mode == "sheet_name"
                  else sum(len(group.files) for group in report.groups))
         progress(f"{count} dosya bulundu. Başlıklar eşleştiriliyor ve veriler birleştiriliyor…")
-        core.collect(report, cfg, core.COLUMN_SCHEMA)
+        core.collect(report, cfg, schema)
         progress("Denetim dosyası yazılıyor…")
         audit = core.save_json_audit(report)
         errors = sum(event["Seviye"] == "ERROR" for event in report.events)
@@ -93,7 +109,7 @@ def run_report(options: RunOptions, progress: Callable[[str], None] = lambda _: 
             raise RuntimeError(f"{errors} kaynak hatası nedeniyle rapor üretilmedi. Denetim: {audit}")
         if not options.dry_run:
             progress("Excel raporu ve grafikler oluşturuluyor…")
-            core.save_report(report, cfg, core.COLUMN_SCHEMA)
+            core.save_report(report, cfg, schema)
         return RunResult(None if options.dry_run else output, audit,
                          sum(len(group.records) for group in report.groups), len(report.groups),
                          sum(event["Seviye"] == "WARNING" for event in report.events),

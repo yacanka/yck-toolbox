@@ -97,7 +97,8 @@ def build(build_root: Path, dist: Path) -> None:
     install_dependencies(python)
     run(python, "-m", "unittest", "discover", "-v")
     run(python, "-m", "compileall", "-q", "excel_fusion.py", "fusion_service.py",
-        "excel_fusion_gui.py", "fusion_smoke.py", "fusion_diagnostics.py",
+        "excel_fusion_gui.py", "fusion_settings.py", "fusion_settings_ui.py",
+        "fusion_smoke.py", "fusion_diagnostics.py",
         "collect_licenses.py", "build_windows.py")
     bundle = dist / "ExcelFusion"
     bundle.mkdir(parents=True, exist_ok=True)
