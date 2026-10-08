@@ -43,7 +43,11 @@
  * Alt+D toggles display protection; Alt+R toggles shutdown protection;
  * Alt+U selects duration.
  * Only a separate exact --activate argument auto-starts with saved options.
- * A second launch shows the existing instance without restarting its timer.
+ * --tray starts hidden in the notification area without a balloon notification.
+ * Windows auto-start uses --activate --tray. Old exact auto-start entries are
+ * upgraded when this version is opened; custom commands are left unchanged.
+ * A second normal launch shows the existing instance without restarting its timer.
+ * A second --tray launch leaves the existing window state and timer unchanged.
  *
  * Prevent screen saver also keeps the display on. Select sleep protection too
  * if the computer must stay awake. Manual sleep, locking, lid actions and policy
@@ -80,6 +84,10 @@
  * timer expiry and exit: Awaken must no longer block. Check startup --activate
  * with the saved option and repeat with all protections enabled. Verify force
  * termination/"Shut down anyway" overrides it; do not expect data preservation.
+ * Startup release checks: enable Windows startup and sign in again; verify no
+ * window flash or balloon, saved protection and timer, then click the tray icon.
+ * Open once after upgrading to migrate an existing auto-start entry. Verify
+ * --tray without --activate remains inactive and tray failure shows the window.
  * Tray release checks: minimize while active/inactive, click the tray icon or
  * its notification, restore via a second launch, and expire while hidden.
  * Restart Explorer while hidden; verify icon recovery. Close after restoring
@@ -158,11 +166,11 @@ END
 #include <stdint.h>
 #include <wchar.h>
 
-/* argv[0] is a path, never an activation request. */
-static int HasActivateArgument(int count, wchar_t **arguments) {
+/* argv[0] is a path, never a launch option. */
+static int HasLaunchArgument(int count, wchar_t **arguments, const wchar_t *option) {
     int index;
     for (index = 1; index < count; ++index) {
-        if (wcscmp(arguments[index], L"--activate") == 0) return 1;
+        if (wcscmp(arguments[index], option) == 0) return 1;
     }
     return 0;
 }
@@ -211,12 +219,23 @@ int main(void) {
     for (index = 0; index < 7; ++index) CHECK(DurationMinutesFromSelection(index) == durations[index]);
     CHECK(DurationMinutesFromSelection(-1) == 0);
     CHECK(DurationMinutesFromSelection(7) == 0);
-    CHECK(!HasActivateArgument(0, NULL));
-    CHECK(!HasActivateArgument(1, pathOnly));
-    CHECK(!HasActivateArgument(2, partial));
-    CHECK(!HasActivateArgument(2, embedded));
-    CHECK(HasActivateArgument(2, exact));
-    CHECK(HasActivateArgument(3, multiple));
+    CHECK(!HasLaunchArgument(0, NULL, L"--activate"));
+    CHECK(!HasLaunchArgument(1, pathOnly, L"--activate"));
+    CHECK(!HasLaunchArgument(2, partial, L"--activate"));
+    CHECK(!HasLaunchArgument(2, embedded, L"--activate"));
+    CHECK(HasLaunchArgument(2, exact, L"--activate"));
+    CHECK(HasLaunchArgument(3, multiple, L"--activate"));
+    {
+        wchar_t *trayPath[] = {L"C:\\--tray\\awaken.exe"};
+        wchar_t *trayPartial[] = {L"awaken.exe", L"--tray-later", L"prefix--tray"};
+        wchar_t *trayExact[] = {L"C:\\Program Files\\Awaken.exe", L"--activate", L"--tray"};
+        CHECK(!HasLaunchArgument(0, NULL, L"--tray"));
+        CHECK(!HasLaunchArgument(1, trayPath, L"--tray"));
+        CHECK(!HasLaunchArgument(3, trayPartial, L"--tray"));
+        CHECK(HasLaunchArgument(3, trayExact, L"--tray"));
+        CHECK(HasLaunchArgument(3, trayExact, L"--activate"));
+        CHECK(!HasLaunchArgument(2, exact, L"--tray"));
+    }
     CHECK(RemainingSeconds(0) == 0);
     CHECK(RemainingSeconds(1) == 1);
     CHECK(RemainingSeconds(999) == 1);
@@ -654,10 +673,10 @@ static BOOL BuildStartupCommand(WCHAR *command, size_t count) {
     WCHAR path[MAX_PATH];
     DWORD length = GetModuleFileNameW(NULL, path, ARRAYSIZE(path));
     return length > 0 && length < ARRAYSIZE(path) &&
-        SUCCEEDED(StringCchPrintfW(command, count, L"\"%s\" --activate", path));
+        SUCCEEDED(StringCchPrintfW(command, count, L"\"%s\" --activate --tray", path));
 }
 
-static BOOL IsStartupEnabled(void) {
+static BOOL IsStartupEnabled(BOOL *legacy) {
     HKEY key = NULL;
     WCHAR actual[MAX_PATH + 32] = {0};
     WCHAR expected[MAX_PATH + 32];
@@ -665,14 +684,21 @@ static BOOL IsStartupEnabled(void) {
     DWORD size = sizeof(actual);
     LONG result;
 
+    if (legacy != NULL) *legacy = FALSE;
     if (!BuildStartupCommand(expected, ARRAYSIZE(expected))) return FALSE;
     result = RegOpenKeyExW(HKEY_CURRENT_USER, REGISTRY_RUN_PATH, 0, KEY_QUERY_VALUE, &key);
     if (result != ERROR_SUCCESS) return FALSE;
     result = RegQueryValueExW(key, REGISTRY_RUN_VALUE, NULL, &type, (LPBYTE)actual, &size);
     RegCloseKey(key);
-    return result == ERROR_SUCCESS && type == REG_SZ &&
-        size >= sizeof(WCHAR) && size <= sizeof(actual) && size % sizeof(WCHAR) == 0 &&
-        actual[size / sizeof(WCHAR) - 1] == L'\0' && wcscmp(actual, expected) == 0;
+    if (result != ERROR_SUCCESS || type != REG_SZ ||
+        size < sizeof(WCHAR) || size > sizeof(actual) || size % sizeof(WCHAR) != 0 ||
+        actual[size / sizeof(WCHAR) - 1] != L'\0') return FALSE;
+    if (wcscmp(actual, expected) == 0) return TRUE;
+    /* Recognize only our exact old command; preserve custom startup entries. */
+    expected[wcslen(expected) - wcslen(L" --tray")] = L'\0';
+    if (wcscmp(actual, expected) != 0) return FALSE;
+    if (legacy != NULL) *legacy = TRUE;
+    return TRUE;
 }
 
 static BOOL SetStartupEnabled(BOOL enabled) {
@@ -724,6 +750,8 @@ static BOOL SetStartupEnabled(BOOL enabled) {
 static void LoadSettings(void) {
     DWORD value;
     int durationIndex = 0;
+    BOOL legacyStartup;
+    BOOL startupEnabled;
 
     Button_SetCheck(g_app.checkSystemSleep, BST_CHECKED);
     Button_SetCheck(g_app.checkDisplayOff, BST_CHECKED);
@@ -747,7 +775,10 @@ static void LoadSettings(void) {
     }
 
     ComboBox_SetCurSel(g_app.comboDuration, durationIndex);
-    Button_SetCheck(g_app.checkStartup, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
+    startupEnabled = IsStartupEnabled(&legacyStartup);
+    /* Best effort upgrade; an unwritable key retains the existing startup setting. */
+    if (legacyStartup) SetStartupEnabled(TRUE);
+    Button_SetCheck(g_app.checkStartup, startupEnabled ? BST_CHECKED : BST_UNCHECKED);
 }
 
 static void SaveSettings(void) {
@@ -1107,7 +1138,7 @@ static void CreateInterface(HWND hwnd) {
     (void)groupBehavior;
 
     g_app.checkStartup = CreateControl(
-        0, L"BUTTON", L"Start Awaken with &Windows and activate protection",
+        0, L"BUTTON", L"Start Awaken in tray with &Windows and activate protection",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
         48, 368, 500, 28,
         hwnd, ID_CHECK_STARTUP, g_app.fontNormal
@@ -1221,6 +1252,14 @@ static void RestoreFromTray(HWND hwnd) {
     ShowWindow(hwnd, SW_RESTORE);
     RemoveTrayIcon(hwnd);
     SetForegroundWindow(hwnd);
+}
+
+static void ShowLaunchWindow(HWND hwnd, BOOL startInTray, int showCommand) {
+    /* The window is created hidden: adding the icon first avoids a startup flash. */
+    if (startInTray && AddTrayIcon(hwnd)) return;
+    /* A failed tray registration must leave the application accessible. */
+    ShowWindow(hwnd, showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
+    UpdateWindow(hwnd);
 }
 
 static void MinimizeToTray(HWND hwnd) {
@@ -1465,6 +1504,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     MSG message;
     RECT windowRect = {0, 0, WINDOW_WIDTH, WINDOW_HEIGHT};
     BOOL activateOnLaunch;
+    BOOL startInTray;
     BOOL getMessageResult;
     HICON largeIcon;
     HICON smallIcon;
@@ -1480,7 +1520,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
         ShowStartupError(L"Awaken could not read its command line.", GetLastError());
         return 1;
     }
-    activateOnLaunch = HasActivateArgument(argumentCount, arguments);
+    activateOnLaunch = HasLaunchArgument(argumentCount, arguments, L"--activate");
+    startInTray = HasLaunchArgument(argumentCount, arguments, L"--tray");
     LocalFree(arguments);
 
     /* One owner per interactive session prevents invisible competing requests. */
@@ -1492,8 +1533,10 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND existing = FindWindowW(APP_CLASS_NAME, NULL);
         if (existing != NULL) {
-            ShowWindow(existing, SW_RESTORE);
-            SetForegroundWindow(existing);
+            if (!startInTray) {
+                ShowWindow(existing, SW_RESTORE);
+                SetForegroundWindow(existing);
+            }
         } else {
             ShowStartupError(L"Another Awaken instance is running, but its window is not ready. "
                 L"Wait a moment and try again. If it remains unavailable, close the existing "
@@ -1578,9 +1621,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)largeIcon);
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)smallIcon);
 
-    /* SW_HIDE alone is not a user request to minimize to the notification area. */
-    ShowWindow(hwnd, showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
-    UpdateWindow(hwnd);
+    ShowLaunchWindow(hwnd, startInTray, showCommand);
 
     if (activateOnLaunch) {
         StartProtection(hwnd);
@@ -1795,6 +1836,88 @@ static void ClickTrayIcon(HWND hwnd, UINT event) {
     CHECK(lastTrayIcon.uCallbackMessage != 0);
     SendMessageW(hwnd, lastTrayIcon.uCallbackMessage, 0,
         MAKELPARAM(event, lastTrayIcon.uID));
+}
+
+static void TestTrayLaunch(HWND hwnd) {
+    unsigned int notifications = trayNotifications;
+    unsigned int adds = trayAdds;
+    CHECK(!IsWindowVisible(hwnd));
+    ShowLaunchWindow(hwnd, TRUE, SW_SHOWNORMAL);
+    CHECK(!IsWindowVisible(hwnd) && g_app.trayIconAdded);
+    CHECK(trayAdds == adds + 1 && trayNotifications == notifications);
+    CHECK(!g_app.active);
+    ClickTrayIcon(hwnd, NIN_SELECT);
+    CHECK(IsWindowVisible(hwnd) && !g_app.trayIconAdded && !g_app.active);
+
+    ShowWindow(hwnd, SW_HIDE);
+    ShowLaunchWindow(hwnd, TRUE, SW_SHOWNORMAL);
+    SelectOptions(TRUE, TRUE, TRUE);
+    ComboBox_SetCurSel(g_app.comboDuration, 1);
+    StartProtection(hwnd);
+    CHECK(g_app.active && !IsWindowVisible(hwnd) && g_app.trayIconAdded);
+    {
+        ULONGLONG startedAt = g_app.startedAt;
+        ULONGLONG endsAt = g_app.endsAt;
+        ClickTrayIcon(hwnd, NIN_SELECT);
+        CHECK(IsWindowVisible(hwnd) && !g_app.trayIconAdded);
+        CHECK(g_app.active && g_app.startedAt == startedAt && g_app.endsAt == endsAt);
+    }
+    CHECK(StopProtection(hwnd));
+
+    ShowWindow(hwnd, SW_HIDE);
+    failTrayAdd = TRUE;
+    ShowLaunchWindow(hwnd, TRUE, SW_HIDE);
+    CHECK(IsWindowVisible(hwnd) && !g_app.trayIconAdded);
+    failTrayAdd = FALSE;
+
+    ShowWindow(hwnd, SW_HIDE);
+    failTrayVersion = TRUE;
+    ShowLaunchWindow(hwnd, TRUE, SW_SHOWNORMAL);
+    CHECK(IsWindowVisible(hwnd) && !g_app.trayIconAdded);
+    CHECK(trayAdds == trayDeletes);
+    failTrayVersion = FALSE;
+
+    ShowWindow(hwnd, SW_HIDE);
+    adds = trayAdds;
+    ShowLaunchWindow(hwnd, FALSE, SW_HIDE);
+    CHECK(IsWindowVisible(hwnd) && !g_app.trayIconAdded && trayAdds == adds);
+    CHECK(trayNotifications == notifications);
+    ShowWindow(hwnd, SW_HIDE);
+}
+
+static void TestStartupRegistration(void) {
+    WCHAR command[MAX_PATH + 32];
+    BOOL legacy = TRUE;
+    HKEY key;
+    CHECK(SetStartupEnabled(FALSE));
+    CHECK(!IsStartupEnabled(&legacy) && !legacy);
+    CHECK(SetStartupEnabled(TRUE));
+    CHECK(IsStartupEnabled(&legacy) && !legacy);
+    CHECK(BuildStartupCommand(command, ARRAYSIZE(command)));
+    CHECK(wcsstr(command, L"\" --activate --tray") != NULL);
+    command[wcslen(command) - wcslen(L" --tray")] = L'\0';
+    CHECK(RegOpenKeyExW(HKEY_CURRENT_USER, REGISTRY_RUN_PATH, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, &key) == ERROR_SUCCESS);
+    CHECK(RegSetValueExW(key, REGISTRY_RUN_VALUE, 0, REG_SZ, (const BYTE *)command,
+        (DWORD)((wcslen(command) + 1) * sizeof(WCHAR))) == ERROR_SUCCESS);
+    CHECK(IsStartupEnabled(&legacy) && legacy);
+    LoadSettings();
+    CHECK(IsStartupEnabled(&legacy) && !legacy);
+    CHECK(Button_GetCheck(g_app.checkStartup) == BST_CHECKED);
+
+    CHECK(StringCchCatW(command, ARRAYSIZE(command), L" --custom") == S_OK);
+    CHECK(RegSetValueExW(key, REGISTRY_RUN_VALUE, 0, REG_SZ, (const BYTE *)command,
+        (DWORD)((wcslen(command) + 1) * sizeof(WCHAR))) == ERROR_SUCCESS);
+    LoadSettings();
+    CHECK(!IsStartupEnabled(&legacy) && !legacy);
+    {
+        WCHAR actual[MAX_PATH + 32];
+        DWORD size = sizeof(actual);
+        CHECK(RegQueryValueExW(key, REGISTRY_RUN_VALUE, NULL, NULL, (LPBYTE)actual, &size) == ERROR_SUCCESS);
+        CHECK(wcscmp(actual, command) == 0);
+    }
+    RegCloseKey(key);
+    CHECK(SetStartupEnabled(FALSE));
+    CHECK(!IsStartupEnabled(NULL));
 }
 
 static void TestTrayLifecycle(HWND hwnd) {
@@ -2019,13 +2142,8 @@ int main(void) {
     hwnd = CreateWindowW(cls.lpszClassName, L"Test", WS_OVERLAPPEDWINDOW,
         0, 0, 1000, 1000, NULL, NULL, cls.hInstance, NULL);
     CHECK(hwnd != NULL && !g_app.interfaceFailed);
-    CHECK(SetStartupEnabled(FALSE));
-    CHECK(!IsStartupEnabled());
-    CHECK(SetStartupEnabled(TRUE));
-    CHECK(IsStartupEnabled());
-    CHECK(SetStartupEnabled(FALSE));
-    CHECK(!IsStartupEnabled());
-
+    TestStartupRegistration();
+    TestTrayLaunch(hwnd);
     TestTrayLifecycle(hwnd);
     TestShutdownReasonApi(hwnd);
     TestShutdownProtection(hwnd);
