@@ -12,6 +12,47 @@ import build_windows as packaging
 
 
 class PackagingTests(unittest.TestCase):
+    def test_tk_data_uses_running_interpreter_library_paths(self):
+        with tempfile.TemporaryDirectory(prefix="fusion tk ") as directory:
+            tcl = Path(directory) / "tcl8.6"
+            tk = Path(directory) / "tk8.6"
+            tcl.mkdir()
+            tk.mkdir()
+            (tcl / "init.tcl").touch()
+            (tk / "tk.tcl").touch()
+            tkinter = MagicMock()
+            window = tkinter.Tk.return_value
+            window.tk.call.side_effect = lambda *args: {
+                ("info", "library"): str(tcl), ("set", "tk_library"): str(tk),
+            }[args]
+            with patch.dict("sys.modules", {"tkinter": tkinter}):
+                self.assertEqual(packaging.tk_data_arguments(), [
+                    "--add-data", f"{tcl};_tcl_data",
+                    "--add-data", f"{tk};_tk_data",
+                ])
+            window.destroy.assert_called_once()
+
+    def test_missing_tk_data_stops_build_before_pyinstaller(self):
+        for missing in ("init.tcl", "tk.tcl"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                library = Path(directory)
+                for filename in ("init.tcl", "tk.tcl"):
+                    if filename != missing:
+                        (library / filename).touch()
+                tkinter = MagicMock()
+                window = tkinter.Tk.return_value
+                window.tk.call.return_value = str(library)
+                with (patch.dict("sys.modules", {"tkinter": tkinter}),
+                      patch.object(packaging, "install_dependencies"),
+                      patch.object(packaging, "run") as command,
+                      patch.object(packaging, "check_bundle", return_value=({"ok": True}, 0.1)),
+                      patch.object(packaging, "archive_bundle") as archive,
+                      self.assertRaisesRegex(RuntimeError, missing)):
+                    packaging.build(library / "build", library / "dist")
+                self.assertFalse(any("PyInstaller" in call.args for call in command.call_args_list))
+                archive.assert_not_called()
+                window.destroy.assert_called_once()
+
     def test_command_preserves_spaces_and_metacharacters(self):
         executable = Path("C:/Project & Tools/python.exe")
         with patch.object(packaging.subprocess, "run") as command:
@@ -80,6 +121,10 @@ class PackagingTests(unittest.TestCase):
             bundle = dist / "ExcelFusion"
             health = {"ok": True, "ui_ready_seconds": 0.5}
             with (patch.object(packaging, "install_dependencies"),
+                  patch.object(packaging, "tk_data_arguments", return_value=[
+                      "--add-data", "C:/Python Tcl/tcl8.6;_tcl_data",
+                      "--add-data", "C:/Python Tcl/tk8.6;_tk_data",
+                  ]),
                   patch.object(packaging, "run") as command,
                   patch.object(packaging, "check_bundle", return_value=(health, 1.25)) as smoke,
                   patch.object(packaging, "archive_bundle") as archive):
@@ -93,6 +138,8 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(freeze[freeze.index("--distpath") + 1], bundle)
             self.assertIn(f"{bundle / 'licenses'};licenses", freeze)
             self.assertIn(f"{bundle / 'README.md'};.", freeze)
+            self.assertIn("C:/Python Tcl/tcl8.6;_tcl_data", freeze)
+            self.assertIn("C:/Python Tcl/tk8.6;_tk_data", freeze)
             self.assertTrue((bundle / "README.md").is_file())
             smoke.assert_called_once_with(bundle, dist / "smoke-result.json")
             archive.assert_called_once_with(bundle, health, 1.25)

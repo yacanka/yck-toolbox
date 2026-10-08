@@ -109,6 +109,11 @@ Hata halinde sıfırdan farklı çıkış kodu döner. Paketleme adımları `bui
 Betik bağımsız bir build ortamı kurar, bağımlılıkları yükler, tüm testleri çalıştırır,
 PyInstaller ile konsolsuz EXE üretir. Ardından **üretilen EXE'yi** açarak Tk ve
 Excel okuma/yazma kontrolü yapar. Kontrol başarısızsa dağıtım ZIP'i oluşturmaz.
+Tcl/Tk veri dizinleri çalışan Tk yorumlayıcısından alınarak EXE'ye açıkça eklenir;
+`init.tcl` veya `tk.tcl` eksikse paketleme durur. EXE açılırken `Can't find a usable
+init.tcl` hatası alırsanız güncel build betiğiyle yeniden paketleyin ve yeni
+`dist/windows-<zaman>/ExcelFusion/ExcelFusion.exe` dosyasını kullanın. Hata Python
+ortam kontrolünde de oluşuyorsa Python 3.11 x64 kurulumunun Tcl/Tk bileşenini onarın.
 Kurulum yalnızca proje kökündeki `wheelhouse/` klasöründen yapılır; paketler veya uyumlu
 sürümler eksikse build durur. İnternete otomatik geçiş yapılmaz. Uygulama çalışırken
 internet veya Excel kurulumu gerekmez.

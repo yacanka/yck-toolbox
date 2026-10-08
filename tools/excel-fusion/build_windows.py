@@ -92,6 +92,28 @@ def install_dependencies(python: Path) -> None:
         ) from exc
 
 
+def tk_data_arguments() -> list[str]:
+    """Bundle the script libraries loaded by Tk, including their startup files."""
+    import tkinter
+
+    window = tkinter.Tk()
+    try:
+        window.withdraw()
+        libraries = (
+            (Path(window.tk.call("info", "library")), "init.tcl", "_tcl_data"),
+            (Path(window.tk.call("set", "tk_library")), "tk.tcl", "_tk_data"),
+        )
+        arguments = []
+        for directory, startup, destination in libraries:
+            if not (directory / startup).is_file():
+                raise RuntimeError(f"Tcl/Tk startup file missing: {directory / startup}")
+            # These destinations match PyInstaller's built-in tkinter runtime hook.
+            arguments.extend(("--add-data", f"{directory};{destination}"))
+        return arguments
+    finally:
+        window.destroy()
+
+
 def build(build_root: Path, dist: Path) -> None:
     python = Path(sys.executable)
     install_dependencies(python)
@@ -100,6 +122,7 @@ def build(build_root: Path, dist: Path) -> None:
         "excel_fusion_gui.py", "fusion_settings.py", "fusion_settings_ui.py",
         "fusion_smoke.py", "fusion_diagnostics.py",
         "collect_licenses.py", "build_windows.py")
+    tk_data = tk_data_arguments()
     bundle = dist / "ExcelFusion"
     bundle.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(PROJECT / "README.md", bundle / "README.md")
@@ -109,6 +132,7 @@ def build(build_root: Path, dist: Path) -> None:
         "--workpath", build_root / "pyinstaller", "--specpath", build_root,
         "--add-data", f"{bundle / 'licenses'};licenses",
         "--add-data", f"{bundle / 'README.md'};.",
+        *tk_data,
         "--exclude-module", "numpy", "--exclude-module", "pandas",
         "--exclude-module", "matplotlib", "--exclude-module", "PIL",
         "--exclude-module", "lxml", "--hidden-import", "python_calamine", "excel_fusion_gui.py")
