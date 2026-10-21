@@ -72,38 +72,61 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(command.call_count, 1)
         archive.assert_not_called()
 
-    def test_offline_install_requires_local_wheels(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with patch.object(packaging, "PROJECT", root), patch.object(packaging, "run") as command:
-                for create_directory in (False, True):
-                    if create_directory:
-                        (root / "wheelhouse").mkdir()
-                    with self.subTest(directory_exists=create_directory), self.assertRaisesRegex(
-                        RuntimeError, "Offline packages are missing"
-                    ):
-                        packaging.install_dependencies(Path("python.exe"))
-            command.assert_not_called()
-
-    def test_offline_install_has_no_network_fallback(self):
+    def test_offline_install_does_not_access_network_when_wheels_suffice(self):
         with tempfile.TemporaryDirectory(prefix="fusion packages ") as directory:
             root = Path(directory)
             wheelhouse = root / "wheelhouse"
             wheelhouse.mkdir()
             (wheelhouse / "fixture.whl").touch()
-            for failure in (None, subprocess.CalledProcessError(1, ["pip"])):
-                with (self.subTest(failure=failure), patch.object(packaging, "PROJECT", root),
-                      patch.object(packaging, "run", side_effect=failure) as command):
-                    if failure:
-                        with self.assertRaisesRegex(RuntimeError, "No online fallback"):
-                            packaging.install_dependencies(Path("python.exe"))
-                    else:
-                        packaging.install_dependencies(Path("python.exe"))
-                    command.assert_called_once_with(
-                        Path("python.exe"), "-m", "pip", "--isolated", "--disable-pip-version-check",
-                        "install", "--no-index", "--find-links", wheelhouse,
-                        "--only-binary=:all:", "-r", "requirements-build.txt",
-                    )
+            with patch.object(packaging, "PROJECT", root), patch.object(packaging, "run") as command:
+                packaging.install_dependencies(Path("python.exe"))
+            command.assert_called_once_with(
+                Path("python.exe"), "-m", "pip", "--isolated", "--disable-pip-version-check",
+                "install", "--no-index", "--find-links", wheelhouse,
+                "--only-binary=:all:", "-r", "requirements-build.txt",
+            )
+
+    def test_missing_or_incomplete_wheels_are_downloaded_before_offline_install(self):
+        for state in ("missing", "empty", "incomplete"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory(prefix="fusion packages ") as directory:
+                root = Path(directory)
+                wheelhouse = root / "wheelhouse"
+                if state != "missing":
+                    wheelhouse.mkdir()
+                if state == "incomplete":
+                    (wheelhouse / "fixture.whl").touch()
+                effects = [subprocess.CalledProcessError(1, ["pip"]), None, None] if state == "incomplete" else [None, None]
+                with (patch.object(packaging, "PROJECT", root),
+                      patch.object(packaging, "run", side_effect=effects) as command):
+                    packaging.install_dependencies(Path("python.exe"))
+                self.assertTrue(wheelhouse.is_dir())
+                calls = [call.args for call in command.call_args_list]
+                self.assertEqual(len(calls), 3 if state == "incomplete" else 2)
+                self.assertEqual(calls[-2], (
+                    Path("python.exe"), "-m", "pip", "--isolated", "--disable-pip-version-check",
+                    "download", "--index-url", "https://pypi.org/simple", "--find-links", wheelhouse,
+                    "--only-binary=:all:", "--dest", wheelhouse, "-r", "requirements-build.txt",
+                ))
+                offline_install = (
+                    Path("python.exe"), "-m", "pip", "--isolated", "--disable-pip-version-check",
+                    "install", "--no-index", "--find-links", wheelhouse,
+                    "--only-binary=:all:", "-r", "requirements-build.txt",
+                )
+                self.assertEqual(calls[-1], offline_install)
+                if state == "incomplete":
+                    self.assertEqual(calls[0], offline_install)
+
+    def test_online_failure_stops_dependency_installation(self):
+        for phase in ("download", "install"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                failure = subprocess.CalledProcessError(1, ["pip", phase])
+                effects = [failure] if phase == "download" else [None, failure]
+                with (patch.object(packaging, "PROJECT", Path(directory)),
+                      patch.object(packaging, "run", side_effect=effects) as command,
+                      self.assertRaisesRegex(RuntimeError, "dependency installation failed") as raised):
+                    packaging.install_dependencies(Path("python.exe"))
+                self.assertIs(raised.exception.__cause__, failure)
+                self.assertEqual(command.call_count, len(effects))
 
     def test_install_failure_stops_before_tests_and_packaging(self):
         with (patch.object(packaging, "install_dependencies", side_effect=RuntimeError("missing wheel")),

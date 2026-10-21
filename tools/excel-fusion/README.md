@@ -114,9 +114,13 @@ Tcl/Tk veri dizinleri çalışan Tk yorumlayıcısından alınarak EXE'ye açık
 init.tcl` hatası alırsanız güncel build betiğiyle yeniden paketleyin ve yeni
 `dist/windows-<zaman>/ExcelFusion/ExcelFusion.exe` dosyasını kullanın. Hata Python
 ortam kontrolünde de oluşuyorsa Python 3.11 x64 kurulumunun Tcl/Tk bileşenini onarın.
-Kurulum yalnızca proje kökündeki `wheelhouse/` klasöründen yapılır; paketler veya uyumlu
-sürümler eksikse build durur. İnternete otomatik geçiş yapılmaz. Uygulama çalışırken
-internet veya Excel kurulumu gerekmez.
+Kurulum önce proje kökündeki `wheelhouse/` klasöründen offline olarak denenir.
+Klasör yoksa, boşsa veya yerel kurulum başarısız olursa betik PyPI üzerinden gerekli
+uyumlu wheel paketlerini indirir ve `wheelhouse/` içine kaydeder. Ardından kurulum
+bu klasörden yeniden yapılır; indirilen paketler sonraki offline build'lerde kullanılabilir.
+Gereksinim dosyalarındaki sabit sürümler ve yalnızca wheel kullanımı korunur.
+İndirme veya yeniden kurulum başarısızsa build durur; ayrıntılar pip çıktısında gösterilir.
+Uygulama çalışırken internet veya Excel kurulumu gerekmez.
 
 Çıktılar `dist/windows-<zaman>/` altındadır:
 
@@ -133,14 +137,16 @@ Mevcut betik imzasız taşınabilir paket üretir.
 
 ### Offline paket hazırlığı
 
-İnternet erişimi olan bir **Windows x64 / Python 3.11** bilgisayarda, aynı
+Tamamen offline build için önceden hazırlık yapabilirsiniz. İnternet erişimi olan bir
+**Windows x64 / Python 3.11** bilgisayarda, aynı
 `requirements.txt` ve `requirements-build.txt` dosyalarıyla bir kez çalıştırın:
 
 ```bat
 py -3.11 -m pip download --only-binary=:all: --dest wheelhouse -r requirements-build.txt
 ```
 
-Bu ayrı hazırlık komutu internet kullanır; build betiği indirme yapmaz.
+Bu ayrı hazırlık komutu internet kullanır. Build betiği de yerel paketler yeterli
+olmadığında otomatik olarak indirme yapar; internet erişimli build için önceden hazırlık gerekmez.
 Oluşan `wheelhouse` klasörünü offline bilgisayarda proje köküne kopyalayın,
 ardından `build_windows.bat` çalıştırın. Dolaylı bağımlılıkların wheel dosyaları da
 klasörde bulunmalıdır; yalnızca uygulama paketlerini kopyalamak yeterli değildir.

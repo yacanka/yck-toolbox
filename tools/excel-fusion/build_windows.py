@@ -74,21 +74,29 @@ def archive_bundle(bundle: Path, health: dict, elapsed: float) -> Path:
 
 
 def install_dependencies(python: Path) -> None:
-    """Install only local wheels; never fall back to an online package index."""
+    """Prefer local wheels; download missing dependencies for this and future builds."""
     wheelhouse = PROJECT / "wheelhouse"
-    if not wheelhouse.is_dir() or not any(wheelhouse.glob("*.whl")):
-        raise RuntimeError(
-            "Offline packages are missing. Populate wheelhouse with Python 3.11 Windows x64 "
-            "wheels for requirements-build.txt; see README.md."
-        )
+    pip = (python, "-m", "pip", "--isolated", "--disable-pip-version-check")
+    install = (*pip, "install", "--no-index", "--find-links", wheelhouse,
+               "--only-binary=:all:", "-r", "requirements-build.txt")
+    if wheelhouse.is_dir() and any(wheelhouse.glob("*.whl")):
+        try:
+            run(*install)
+            return
+        except subprocess.CalledProcessError:
+            print("Offline dependency installation failed; trying an online download.")
+    else:
+        print("Offline packages are missing; trying an online download.")
+    wheelhouse.mkdir(parents=True, exist_ok=True)
     try:
-        run(python, "-m", "pip", "--isolated", "--disable-pip-version-check", "install",
-            "--no-index", "--find-links", wheelhouse, "--only-binary=:all:",
+        run(*pip, "download", "--index-url", "https://pypi.org/simple",
+            "--find-links", wheelhouse, "--only-binary=:all:", "--dest", wheelhouse,
             "-r", "requirements-build.txt")
+        run(*install)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
-            "Offline dependency installation failed. Check wheelhouse for all required "
-            "Python 3.11 Windows x64 wheels. No online fallback was attempted."
+            "Build dependency installation failed after online fallback. Check the pip output, "
+            "network access to PyPI, and wheelhouse for compatible Python 3.11 Windows x64 wheels."
         ) from exc
 
 
